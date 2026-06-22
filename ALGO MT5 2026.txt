@@ -2708,7 +2708,10 @@ private:
       op.family=fam; op.tfIdx=tfIdx; op.tf=OmegaTfEnum(tfIdx); op.direction=dir;
       op.entry=entry; op.target=target; op.invalidation=inv; op.label=FamilyName(fam);
       bool ct=(dir!=0 && s.fractalStackDir!=0 && dir!=s.fractalStackDir);
-      if(ct) conv*=0.78;
+      //--- ALIGN ALL OF THIS: network bias ↔ curve-tree owner ↔ fractal stack ↔
+      //    canonical wave. Full agreement lifts conviction, disagreement dampens.
+      int aln=(s.netBias==dir?1:0)+(s.ownerDir==dir?1:0)+(s.fractalStackDir==dir?1:0)+(s.tfDir[TF_CANON]==dir?1:0);
+      conv*=(0.70+(double)aln/4.0*0.45);     // 0.70 (none) .. 1.15 (all four agree)
       op.conviction=OmegaMath::Clamp(conv,0.0,100.0);
       op.mgmt=PickMgmt(fam,ct,s);
       double atr=MathMax(s.atr,1e-10);
@@ -3127,7 +3130,7 @@ public:
       if(!c.partialDone)
         {
          bool tgtHit = (!IsNa(c.initTarget)) && ((dir==1 && curPrice>=c.initTarget) || (dir==-1 && curPrice<=c.initTarget));
-         bool matureFade = (s.fce_maturity>82.0 && s.fce_budget<25.0);
+         bool matureFade = (s.fce_maturity>82.0 && s.fce_budget<25.0 && s.cpState!=2);  // hold through pullback while force PERSISTING
          if(tgtHit || matureFade){ v.doPartial=true; v.reason="first objective / maturity — bank partial"; }
         }
       if(InpTrailStops && !IsNa(o.ie2_inv)) { v.doTrail=true; v.newSL=o.ie2_inv; }
@@ -3272,6 +3275,17 @@ private:
    static string WtTfN(int wt){ return wt==9?"MN":wt==8?"W":wt==7?"D":wt==6?"H4":wt==5?"H1":wt==4?"M15":wt==3?"M5":wt==2?"M3":"M1"; }
    static string PxS(double px){ return IsNa(px)?"—":DoubleToString(px,_Digits); }
    static string NodeL(int wt,int dir,double px){ return IsNa(px)?"—":WtTfN(wt)+(dir==1?"▲":dir==-1?"▼":"·")+DoubleToString(px,_Digits); }
+   //--- network co-pilot story: where price is, what it left, what it's attacking
+   static string CoPilotStory(const F60State &s)
+     {
+      double c=s.close;
+      string loc=(!IsNa(s.path.fezHi)&&!IsNa(s.path.fezLo)&&c<=s.path.fezHi&&c>=s.path.fezLo)?"in FEZ"
+                 :(!IsNa(s.path.fezHi)&&c>s.path.fezHi)?"above net"
+                 :(!IsNa(s.path.fezLo)&&c<s.path.fezLo)?"below net":"mid-net";
+      string frm=IsNa(s.path.fromPx)?"—":WtTfN(s.path.fromWt)+(s.path.fromDir==1?" demand":" supply");
+      string att=IsNa(s.path.toPx)?"—":WtTfN(s.path.toWt)+(s.path.toDir==1?" demand":" supply");
+      return loc+" · left "+frm+" · atk "+att;
+     }
    //--- formatters
    static string Arrow(int d){ return d==1?"▲":d==-1?"▼":"—"; }
    static string Gauge(double pct){ int n=(int)MathMax(0,MathMin(8,MathRound(pct/12.5))); string s=""; for(int i=0;i<8;i++) s+=(i<n?"▰":"▱"); return s; }
@@ -3325,6 +3339,8 @@ public:
       Row(r++, StringFormat("Life     %s %.0f  %s", Gauge(s.life), s.life, LifeVerdict(s.life)), LifeCol(s.life));
       Row(r++, StringFormat("Trinity  L %.0f   S %.0f   C %.0f", tri.life, tri.stability, tri.confidence), FG);
       Row(r++, StringFormat("Narrative %.0f%%  %s", s.narrative, o.ne_story), FG);
+      int aln=(s.netBias==s.ownerDir?1:0)+(s.fractalStackDir==s.ownerDir?1:0)+(s.tfDir[TF_CANON]==s.ownerDir?1:0)+(s.timeDir==s.ownerDir?1:0);
+      Row(r++, StringFormat("Align    net%s wave%s tree%s  (%d/4)", Arrow(s.netBias), Arrow(s.tfDir[TF_CANON]), Arrow(s.ownerDir), aln), aln>=3?GRN:aln==2?AMB:RED);
       Row(r++, StringFormat("Energy   residual %.0f   exhaust %.0f", o.erf_residual, o.erf_exhaustScore), FG);
       Row(r++, StringFormat("Observ   MCE %.0f/cf%.0f  RIE %.0f  FRZ %.0f  TQE %.0f", o.mce_score, o.mce_conflict, o.rie_rotationProb, o.frz_approachQ, o.tqe_quality), FG);
       Row(r++, StringFormat("Senseei  %s  conf %.0f  threat %.0f", MasterStr(meta.master), meta.confidence, meta.threat), DirCol(meta.master));
@@ -3339,7 +3355,8 @@ public:
       Row(r++, "Setup    "+setupTx, (haveScan&&best.valid)?GRN:DIM);
 
       //=== NETWORK PATH (likely / alternate / counter / future) =====
-      Row(r++, "── NETWORK PATH ────────────────────", DIM);
+      Row(r++, "── NETWORK PATH (co-pilot) ─────────", DIM);
+      Row(r++, "Story    "+CoPilotStory(s), CYA);
       Row(r++, StringFormat("Primary  %.0f%%  %s", s.path.primaryConf, s.path.route), GRN);
       Row(r++, "  -> "+NodeL(s.path.toWt,s.path.toDir,s.path.toPx)+"  -> "+NodeL(s.path.thenWt,s.path.thenDir,s.path.thenPx), FG);
       Row(r++, StringFormat("Alt %.0f%% %s   Ctr %.0f%% %s", s.path.altConf, NodeL(s.path.altWt,s.path.altDir,s.path.altPx), s.path.counterConf, NodeL(s.path.ctrWt,s.path.ctrDir,s.path.ctrPx)), AMB);
@@ -3358,6 +3375,9 @@ public:
         { int h=PositionIntelligence::Health(s,o,netDir);
           color hc=(h==CH_HEALTHY||h==CH_ACCELERATING)?GRN:(h==CH_STALLING||h==CH_TRANSITIONING)?AMB:RED;
           Row(r++, "Campaign "+PositionIntelligence::HealthStr(h), hc); }
+      //--- curve budget: room left to HTF + pullback-vs-continue read
+      bool pbCont=(s.cpState==2 && s.treeRecursionBudget>s.treeDepth && s.retrX<70.0);
+      Row(r++, StringFormat("Budget   %d/%d  retr %.0f%%  %s", s.treeDepth, s.treeRecursionBudget, s.retrX, pbCont?"CONTINUE":"FADE"), pbCont?GRN:AMB);
 
       //--- ACTION — what the organism is about to do
       string act; color ac;
