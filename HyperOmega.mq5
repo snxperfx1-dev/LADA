@@ -87,6 +87,7 @@ input int    InpSlippagePoints   = 30;      // Max slippage (points)
 input double InpMinStopAtr       = 0.75;    // Min stop (ATR multiple)
 input bool   InpTrailStops       = true;    // Trail stop to invalidation
 input bool   InpUseTargetTP      = true;    // Place TP at objective
+input bool   InpFuStopLoss       = true;    // Anchor SL to the protective FU candle / flip zone
 input int    InpExitConfirmBars  = 2;       // Bars an invalidation must persist before exiting (constant communication)
 
 input group "=== Diagnostics ==="
@@ -2634,6 +2635,34 @@ public:
 #define __HYPEROMEGA_OPPORTUNITY_MQH__
 
 
+//--- FU-candle stop placement. The protective stop is anchored to the FU / flip
+//    structure behind the trade direction (NOT the generic IE2 invalidation):
+//      1) the "true induction" FU candle (strongest active flip in our dir)
+//      2) the active flip-zone / order-block boundary (flipBot long / flipTop short)
+//      3) the nearest invisible-network FU node on the protective side
+//    Returns NA when no FU level exists on the protective side (caller falls back
+//    to the ATR stop). A small ATR buffer is placed BEYOND the candle so a wick
+//    into the FU doesn't stop us out.
+double FuStopLevel(const F60State &s,int dir,double entry,double atr)
+  {
+   if(dir==0 || atr<=0) return NA_VAL;
+   double buf=atr*0.25;
+   // 1) true-induction FU candle (strongest), must be on the protective side
+   if(!IsNa(s.flipTrueInductionPx) && s.flipTrueInductionDir==dir)
+     {
+      double px=s.flipTrueInductionPx;
+      if(dir==1  && px<entry) return px-buf;
+      if(dir==-1 && px>entry) return px+buf;
+     }
+   // 2) active flip-zone / order-block boundary
+   if(dir==1  && !IsNa(s.flipBot) && s.flipBot<entry) return s.flipBot-buf;
+   if(dir==-1 && !IsNa(s.flipTop) && s.flipTop>entry) return s.flipTop+buf;
+   // 3) nearest invisible-network FU node on the protective side
+   if(dir==1  && !IsNa(s.nodeBelow) && s.nodeBelow<entry) return s.nodeBelow-buf;
+   if(dir==-1 && !IsNa(s.nodeAbove) && s.nodeAbove>entry) return s.nodeAbove+buf;
+   return NA_VAL;
+  }
+
 enum EntryFamily
   {
    FAM_NONE=0, FAM_COMPRESSION, FAM_ROTATION, FAM_NETWORK, FAM_CONTINUATION,
@@ -3258,7 +3287,13 @@ public:
          bool matureFade = (s.fce_maturity>82.0 && s.fce_budget<25.0 && s.cpState!=2);  // hold through pullback while force PERSISTING
          if(tgtHit || matureFade){ v.doPartial=true; v.reason="first objective / maturity — bank partial"; }
         }
-      if(InpTrailStops && !IsNa(o.ie2_inv)) { v.doTrail=true; v.newSL=o.ie2_inv; }
+      if(InpTrailStops)
+        {
+         double trail=NA_VAL;
+         if(InpFuStopLoss){ double fu=FuStopLevel(s,dir,curPrice,s.atr); if(!IsNa(fu)) trail=fu; }
+         if(IsNa(trail)) trail=o.ie2_inv;
+         if(!IsNa(trail)){ v.doTrail=true; v.newSL=trail; }   // ModifySL only tightens in our favour
+        }
      }
 
    //--- classify the live campaign's behaviour (Stage 6 readout + management bias)
@@ -3644,6 +3679,16 @@ public:
          else return;
         }
       double atr=m_sub.CanonAtr(); if(atr<=0) return;
+      //--- FU-CANDLE STOP: anchor the protective stop to the FU / flip structure
+      //    (true-induction FU candle -> flip-zone boundary -> nearest network FU
+      //    node) instead of the generic IE2 invalidation. Open() still floors the
+      //    distance at InpMinStopAtr*ATR so a tight FU can't inflate size.
+      if(InpFuStopLoss)
+        {
+         double e=(op.direction==1)?SymbolInfoDouble(m_sym,SYMBOL_ASK):SymbolInfoDouble(m_sym,SYMBOL_BID);
+         double fu=FuStopLevel(m_f60,op.direction,e,atr);
+         if(!IsNa(fu)) op.invalidation=fu;
+        }
       if(posDir==0)
         {
          if(triVeto){ OmegaLogger::Warn("RISK",m_sym+" Trinity override — fresh entry vetoed (low life/confidence)"); return; }
