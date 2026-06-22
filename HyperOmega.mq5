@@ -85,8 +85,15 @@ input bool   InpUseTargetTP      = true;    // Place TP at objective
 input group "=== Diagnostics ==="
 input int    InpWarmupBars       = 600;     // Warmup bars per TF
 input int    InpHeartbeatSec     = 60;      // Heartbeat log interval (sec)
-input bool   InpShowComment      = true;    // On-chart status comment
+input bool   InpShowComment      = false;   // On-chart text comment (fallback; off when dashboard on)
 input bool   InpCsvLogs          = false;   // Write CSV logs
+
+input group "=== Dashboard (on-chart: seeing / thinking / doing) ==="
+input bool   InpShowDashboard    = true;    // Show the on-chart dashboard panel
+input int    InpDashCorner       = 0;       // Corner: 0=TL 1=TR 2=BL 3=BR
+input int    InpDashX            = 14;      // X offset from corner (px)
+input int    InpDashY            = 30;      // Y offset from corner (px)
+input int    InpDashFont         = 9;       // Font size (Consolas)
 
 
 //==================================================================
@@ -2929,6 +2936,152 @@ public:
 
 #endif // __HYPEROMEGA_POSITION_INTELLIGENCE_MQH__
 
+// ====================== Include/Dashboard.mqh ======================
+//+------------------------------------------------------------------+
+//|                                                    Dashboard.mqh |
+//|                                            HYPEROMEGA (OMEGA-F72) |
+//|                                                                  |
+//|   On-chart panel — what the algo is SEEING (perception),         |
+//|   THINKING (cognition/observers/trinity/opportunity), and DOING  |
+//|   (capital/exposure/position/action). Native chart objects only  |
+//|   (OBJ_RECTANGLE_LABEL frame + OBJ_LABEL rows), magic-prefixed   |
+//|   for clean teardown. Pure observer — never affects a decision.  |
+//+------------------------------------------------------------------+
+#ifndef __HYPEROMEGA_DASHBOARD_MQH__
+#define __HYPEROMEGA_DASHBOARD_MQH__
+
+
+class Dashboard
+  {
+private:
+   string m_pfx; int m_rows; bool m_init;
+   //--- palette
+   color FG, DIM, GRN, RED, AMB, CYA, BG, BRD;
+
+   int Corner() const { return InpDashCorner==1?CORNER_RIGHT_UPPER:InpDashCorner==2?CORNER_LEFT_LOWER:InpDashCorner==3?CORNER_RIGHT_LOWER:CORNER_LEFT_UPPER; }
+   int Anchor() const { return (InpDashCorner==1||InpDashCorner==3)?ANCHOR_RIGHT_UPPER:ANCHOR_LEFT_UPPER; }
+   int RowH()   const { return InpDashFont+6; }
+
+   void Row(int idx,string txt,color clr)
+     {
+      string nm=m_pfx+"_r"+IntegerToString(idx);
+      if(ObjectFind(0,nm)<0) ObjectCreate(0,nm,OBJ_LABEL,0,0,0);
+      ObjectSetInteger(0,nm,OBJPROP_CORNER,Corner());
+      ObjectSetInteger(0,nm,OBJPROP_ANCHOR,Anchor());
+      ObjectSetInteger(0,nm,OBJPROP_XDISTANCE,InpDashX);
+      ObjectSetInteger(0,nm,OBJPROP_YDISTANCE,InpDashY+idx*RowH());
+      ObjectSetString (0,nm,OBJPROP_TEXT,txt);
+      ObjectSetInteger(0,nm,OBJPROP_COLOR,clr);
+      ObjectSetInteger(0,nm,OBJPROP_FONTSIZE,InpDashFont);
+      ObjectSetString (0,nm,OBJPROP_FONT,"Consolas");
+      ObjectSetInteger(0,nm,OBJPROP_BACK,false);
+      ObjectSetInteger(0,nm,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,nm,OBJPROP_HIDDEN,true);
+      if(idx+1>m_rows) m_rows=idx+1;
+     }
+   void Bg(int rows)
+     {
+      string nm=m_pfx+"_bg";
+      if(ObjectFind(0,nm)<0) ObjectCreate(0,nm,OBJ_RECTANGLE_LABEL,0,0,0);
+      ObjectSetInteger(0,nm,OBJPROP_CORNER,Corner());
+      ObjectSetInteger(0,nm,OBJPROP_ANCHOR,Anchor());
+      ObjectSetInteger(0,nm,OBJPROP_XDISTANCE,InpDashX-8);
+      ObjectSetInteger(0,nm,OBJPROP_YDISTANCE,InpDashY-8);
+      ObjectSetInteger(0,nm,OBJPROP_XSIZE,388);
+      ObjectSetInteger(0,nm,OBJPROP_YSIZE,rows*RowH()+14);
+      ObjectSetInteger(0,nm,OBJPROP_BGCOLOR,BG);
+      ObjectSetInteger(0,nm,OBJPROP_BORDER_TYPE,BORDER_FLAT);
+      ObjectSetInteger(0,nm,OBJPROP_COLOR,BRD);
+      ObjectSetInteger(0,nm,OBJPROP_BACK,true);
+      ObjectSetInteger(0,nm,OBJPROP_SELECTABLE,false);
+      ObjectSetInteger(0,nm,OBJPROP_HIDDEN,true);
+     }
+   //--- formatters
+   static string Arrow(int d){ return d==1?"▲":d==-1?"▼":"—"; }
+   static string Gauge(double pct){ int n=(int)MathMax(0,MathMin(8,MathRound(pct/12.5))); string s=""; for(int i=0;i<8;i++) s+=(i<n?"▰":"▱"); return s; }
+   color DirCol(int d) const { return d==1?GRN:d==-1?RED:DIM; }
+   static string LifeVerdict(double l){ return l>=60.0?"ALIVE":l>=45.0?"HOLD":l>32.0?"WEAK":"DEAD"; }
+   color LifeCol(double l) const { return l>=60.0?GRN:l>32.0?AMB:RED; }
+   static string CpStateStr(int c){ return c==2?"PERSISTING":c==0?"LEAKING":"NEUTRAL"; }
+   color CpCol(int c) const { return c==2?GRN:c==0?RED:AMB; }
+   static string MasterStr(int m){ return m==1?"▲ BULL":m==-1?"▼ BEAR":"○ —"; }
+   color OppCol(string opp) const { return (opp=="STRONG"||opp=="EXCEPTIONAL")?GRN:(opp=="GOOD")?AMB:DIM; }
+   color CapCol(ENUM_CAP_STATE s) const { return s==CAP_HEALTHY?GRN:s==CAP_WARNING?AMB:RED; }
+   string MtfRow(const F60State &s) const
+     {
+      string r="";
+      for(int i=0;i<9;i++) r+=OmegaTfName(i)+(s.tfDir[i]==1?"▲":s.tfDir[i]==-1?"▼":"·")+" ";
+      return r;
+     }
+public:
+   void Init(string pfx)
+     {
+      m_pfx=pfx; m_rows=0; m_init=true;
+      FG=clrGainsboro; DIM=C'148,163,184'; GRN=C'52,211,153'; RED=C'251,113,133';
+      AMB=C'251,191,36'; CYA=C'34,211,238'; BG=C'10,14,39'; BRD=C'34,40,72';
+     }
+   void Deinit(){ if(m_init) ObjectsDeleteAll(0,m_pfx); }
+
+   //--- render the full panel for the chart symbol's engine
+   void Render(string sym,const F60State &s,const ObserverBus &o,const Trinity &tri,
+               const Opportunity &best,const MetaInputs &meta,bool haveScan,
+               int posCount,int netDir,OmegaCapital &cap,int campaigns,int maxConc,double openRisk)
+     {
+      if(!InpShowDashboard) return;
+      int r=0;
+      int otf=s.ownerTf>=0?s.ownerTf:TF_CANON;
+
+      Row(r++, StringFormat("HYPEROMEGA  %s  v%s", sym, OMEGA_VERSION), CYA);
+
+      //=== SEEING ===================================================
+      Row(r++, "── SEEING (perception) ─────────────", DIM);
+      Row(r++, "Phase    "+s.tfPhaseStr[TF_CANON], FG);
+      Row(r++, StringFormat("Owner    %-3s %s  energy %.0f", OmegaTfName(otf), Arrow(s.ownerDir), s.treeOwnerEnergy), DirCol(s.ownerDir));
+      Row(r++, StringFormat("Fractal  %s  %.0f%% aligned", Arrow(s.fractalStackDir), s.fractalStackScore), DirCol(s.fractalStackDir));
+      Row(r++, StringFormat("Network  %s  prs %.0f  nodes %d/%d", Arrow(s.netBias), s.pressure, s.eligibleNodes, s.nodeCount), DirCol(s.netBias));
+      Row(r++, StringFormat("Compress %s %.0f  %s", Gauge(s.tfComp[TF_CANON]), s.tfComp[TF_CANON], CpStateStr(s.cpState)), CpCol(s.cpState));
+      Row(r++, StringFormat("Time     %s  align %.0f%%", Arrow(s.timeDir), s.timeAlign), FG);
+      Row(r++, "MTF  "+MtfRow(s), FG);
+
+      //=== THINKING =================================================
+      Row(r++, "── THINKING (cognition) ────────────", DIM);
+      Row(r++, StringFormat("Life     %s %.0f  %s", Gauge(s.life), s.life, LifeVerdict(s.life)), LifeCol(s.life));
+      Row(r++, StringFormat("Trinity  L %.0f   S %.0f   C %.0f", tri.life, tri.stability, tri.confidence), FG);
+      Row(r++, StringFormat("Narrative %.0f%%  %s", s.narrative, o.ne_story), FG);
+      Row(r++, StringFormat("Energy   residual %.0f   exhaust %.0f", o.erf_residual, o.erf_exhaustScore), FG);
+      Row(r++, StringFormat("Observ   MCE %.0f/cf%.0f  RIE %.0f  FRZ %.0f  TQE %.0f", o.mce_score, o.mce_conflict, o.rie_rotationProb, o.frz_approachQ, o.tqe_quality), FG);
+      Row(r++, StringFormat("Senseei  %s  conf %.0f  threat %.0f", MasterStr(meta.master), meta.confidence, meta.threat), DirCol(meta.master));
+      Row(r++, StringFormat("Opp      %s · %s · %s", meta.opportunity, meta.timing, meta.intent), OppCol(meta.opportunity));
+      string setupTx = (haveScan && best.valid)
+                       ? StringFormat("%s/%s %s  conv %.0f  asym %.2f", FamilyName(best.family), MgmtName(best.mgmt),
+                                       best.direction==1?"LONG":best.direction==-1?"SHORT":"-", best.conviction, best.asymmetry)
+                       : "no qualified setup";
+      Row(r++, "Setup    "+setupTx, (haveScan&&best.valid)?GRN:DIM);
+
+      //=== DOING ====================================================
+      Row(r++, "── DOING (execution) ───────────────", DIM);
+      Row(r++, StringFormat("Capital  %s  throttle %.2f", CapName(cap.State()), cap.Throttle()), CapCol(cap.State()));
+      Row(r++, StringFormat("Drawdown d %.2f%%  w %.2f%%  h %.2f%%", cap.DDd(), cap.DDw(), cap.DDh()), FG);
+      Row(r++, StringFormat("Exposure open %.2f%% / cap %.2f%%", openRisk, InpMaxPortfolioRisk), FG);
+      Row(r++, StringFormat("Position %d  %s   campaigns %d/%d", posCount, posCount>0?(netDir==1?"LONG":"SHORT"):"flat", campaigns, maxConc), posCount>0?DirCol(netDir):DIM);
+
+      //--- ACTION — what the organism is about to do
+      string act; color ac;
+      if(cap.RequiresFlat())            { act="FLATTEN — capital suspended"; ac=RED; }
+      else if(posCount>0)               { act="MANAGING open position";      ac=CYA; }
+      else if(cap.BlocksEntries())      { act="STAND DOWN — capital restricted"; ac=AMB; }
+      else if(tri.confidence<25.0||tri.life<20.0) { act="VETO — Trinity (low life/confidence)"; ac=AMB; }
+      else if(haveScan && best.valid)   { act="READY — "+FamilyName(best.family)+" "+(best.direction==1?"LONG":"SHORT"); ac=GRN; }
+      else                              { act="WAITING for a qualified setup"; ac=DIM; }
+      Row(r++, "Action   "+act, ac);
+
+      Bg(r);
+      ChartRedraw(0);
+     }
+  };
+
+#endif // __HYPEROMEGA_DASHBOARD_MQH__
+
 // ====================== Include/Portfolio.mqh ======================
 //+------------------------------------------------------------------+
 //|                                                    Portfolio.mqh |
@@ -3050,6 +3203,12 @@ public:
               fam, m_exec.CountActive());
      }
    void Trinity3(double &l,double &s,double &c){ l=m_trinity.life; s=m_trinity.stability; c=m_trinity.confidence; }
+   //--- render this symbol's full state into the shared dashboard panel
+   void RenderDashboard(Dashboard &dash,OmegaCapital &cap,int campaigns,int maxConc,double openRisk)
+     {
+      dash.Render(m_sym, m_f60, m_obs, m_trinity, m_best, m_meta, m_haveScan,
+                  m_exec.CountActive(), m_exec.NetDir(), cap, campaigns, maxConc, openRisk);
+     }
   };
 
 //==================================================================
@@ -3059,6 +3218,7 @@ class Portfolio
   {
 private:
    SymbolEngine m_eng[32]; int m_count;
+   Dashboard    m_dash;
 public:
    void Init()
      {
@@ -3078,6 +3238,7 @@ public:
          if(m_count==0){ m_eng[0].Init(_Symbol); m_count=1; }
         }
       for(int i=0;i<m_count;i++) m_eng[i].Warmup(InpWarmupBars);
+      m_dash.Init("HO_DASH");
       OmegaLogger::Info("PORT",StringFormat("Tracking %d symbol(s)",m_count));
      }
    int CountActiveCampaigns(){ int n=0; for(int i=0;i<m_count;i++) if(m_eng[i].HasPosition()) n++; return n; }
@@ -3095,6 +3256,16 @@ public:
      }
    string Diag(){ string s=""; for(int i=0;i<m_count && i<8;i++) s+=m_eng[i].Diag()+"\n"; return s; }
    int Count(){ return m_count; }
+   //--- render the dashboard for the CHART symbol's engine (or the first)
+   void RenderDashboard(OmegaCapital &cap)
+     {
+      if(!InpShowDashboard || m_count<=0) return;
+      int idx=-1;
+      for(int i=0;i<m_count;i++) if(m_eng[i].Sym()==_Symbol){ idx=i; break; }
+      if(idx<0) idx=0;
+      m_eng[idx].RenderDashboard(m_dash, cap, CountActiveCampaigns(), InpMaxConcurrent, OmegaRisk::OpenRiskPct(InpMagic));
+     }
+   void DeinitDashboard(){ m_dash.Deinit(); }
   };
 
 #endif // __HYPEROMEGA_PORTFOLIO_MQH__
@@ -3120,6 +3291,7 @@ int OnInit()
 void OnDeinit(const int reason)
   {
    EventKillTimer();
+   g_port.DeinitDashboard();
    Comment("");
    OmegaLogger::LogInfo("EA", StringFormat("Deinit reason=%d", reason));
    OmegaLogger::Shutdown();
@@ -3129,7 +3301,8 @@ void OnTick()
   {
    g_capital.Update();
    g_port.Update(g_capital);
-   if(InpShowComment)
+   if(InpShowDashboard) g_port.RenderDashboard(g_capital);
+   if(InpShowComment && !InpShowDashboard)
      {
       string cm=StringFormat("HYPEROMEGA · %d sym · campaigns=%d/%d\nCapital: %s · thr=%.2f · ddD=%.2f%% ddW=%.2f%% openRisk=%.2f%%\n%s",
                   g_port.Count(), g_port.CountActiveCampaigns(), InpMaxConcurrent,
