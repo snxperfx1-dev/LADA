@@ -3005,8 +3005,9 @@ public:
          double md=MinStopDist(); if(md>0&&MathAbs(px-newSL)<md) continue;
          if(improve&&side) m_trade.PositionModify(tk,NormPx(newSL),tp); }
      }
-   //--- open an opportunity (sizing by conviction · throttle · exposure; SL/TP by mgmt)
-   bool Open(const Opportunity &op,double atr,double convFrac,double throttle,double exposureBudgetPct,ulong &ticketOut,double &volOut)
+   //--- open an opportunity (sizing by conviction · throttle · exposure; TP ladder t1/t2/t3)
+   bool Open(const Opportunity &op,double atr,double convFrac,double throttle,double exposureBudgetPct,
+             double t1,double t2,double t3,ulong &ticketOut,double &volOut)
      {
       ticketOut=0; volOut=0; if(op.direction==0||atr<=0) return false;
       double ask=SymbolInfoDouble(m_sym,SYMBOL_ASK), bid=SymbolInfoDouble(m_sym,SYMBOL_BID);
@@ -3018,15 +3019,14 @@ public:
       if(md>0){ if(op.direction==1&&(entry-stop)<md) stop=entry-md; if(op.direction==-1&&(stop-entry)<md) stop=entry+md; }
       stop=NormPx(stop);
       double stopPts=MathAbs(entry-stop)/m_point; if(stopPts<=0) return false;
+      //--- broker TP = the FINAL ladder target (safety net); TP1/TP2 partials are
+      //    taken manually in ManagePosition. Runner rides to t3 / terminal.
       double tp=0.0;
       if(InpUseTargetTP)
         {
-         double riskDist=MathAbs(entry-stop);
-         double tgt=op.target;
-         if(op.mgmt==MGMT_SCALP||op.mgmt==MGMT_COUNTERTREND){ double cap=(op.direction==1)?entry+riskDist*1.8:entry-riskDist*1.8; tgt=IsNa(tgt)?cap:(op.direction==1?MathMin(tgt,cap):MathMax(tgt,cap)); }
-         if(op.mgmt==MGMT_RUNNER) tgt=op.target;
-         if(!IsNa(tgt)&&((op.direction==1&&tgt>entry)||(op.direction==-1&&tgt<entry)))
-           { if(md<=0||MathAbs(tgt-entry)>=md) tp=NormPx(tgt); }
+         double finalT = !IsNa(t3)?t3 : !IsNa(t2)?t2 : !IsNa(t1)?t1 : op.target;
+         if(!IsNa(finalT)&&((op.direction==1&&finalT>entry)||(op.direction==-1&&finalT<entry)))
+            if(md<=0||MathAbs(finalT-entry)>=md) tp=NormPx(finalT);
         }
       double riskPct=InpRiskPctBase*OmegaMath::Clamp(convFrac,0.0,1.0);
       if(op.mgmt==MGMT_COUNTERTREND) riskPct*=0.5;
@@ -3037,8 +3037,8 @@ public:
       string cmt=StringFormat("HO %s/%s %s",FamilyName(op.family),MgmtName(op.mgmt),OmegaTfName(op.tfIdx));
       bool ok=(op.direction==1)?m_trade.Buy(lots,m_sym,0.0,stop,tp,cmt):m_trade.Sell(lots,m_sym,0.0,stop,tp,cmt);
       if(ok){ ticketOut=m_trade.ResultOrder(); volOut=lots;
-              OmegaLogger::Decide("HYPER",StringFormat("%s OPEN %s %s/%s lots=%.2f conv=%.0f asym=%.2f SL=%.5f TP=%.5f",
-                 m_sym,op.direction==1?"LONG":"SHORT",FamilyName(op.family),MgmtName(op.mgmt),lots,op.conviction,op.asymmetry,stop,tp)); }
+              OmegaLogger::Decide("HYPER",StringFormat("%s OPEN %s %s/%s lots=%.2f conv=%.0f asym=%.2f SL=%.5f T1=%.5f T2=%.5f T3=%.5f",
+                 m_sym,op.direction==1?"LONG":"SHORT",FamilyName(op.family),MgmtName(op.mgmt),lots,op.conviction,op.asymmetry,stop,t1,t2,t3)); }
       else OmegaLogger::Warn("EXEC",StringFormat("%s OPEN failed ret=%d",m_sym,m_trade.ResultRetcode()));
       return ok;
      }
@@ -3066,7 +3066,8 @@ struct Campaign
   {
    bool   active; int dir; double entry, initialSL, initTarget, origVol;
    EntryFamily family; MgmtStyle mgmt; bool partialDone; int adds; ulong ticket;
-   void Reset(){ active=false; dir=0; entry=0; initialSL=NA_VAL; initTarget=NA_VAL; origVol=0; family=FAM_NONE; mgmt=MGMT_NORMAL; partialDone=false; adds=0; ticket=0; }
+   double tp1, tp2, tp3; bool tp1Done, tp2Done;
+   void Reset(){ active=false; dir=0; entry=0; initialSL=NA_VAL; initTarget=NA_VAL; origVol=0; family=FAM_NONE; mgmt=MGMT_NORMAL; partialDone=false; adds=0; ticket=0; tp1=NA_VAL; tp2=NA_VAL; tp3=NA_VAL; tp1Done=false; tp2Done=false; }
   };
 struct PositionVerdict { bool doExit, doPartial, doTrail, doReverse; double newSL; string reason; };
 
@@ -3239,7 +3240,8 @@ public:
    //--- render the full panel for the chart symbol's engine
    void Render(string sym,const F60State &s,const ObserverBus &o,const Trinity &tri,
                const Opportunity &best,const MetaInputs &meta,bool haveScan,
-               int posCount,int netDir,OmegaCapital &cap,int campaigns,int maxConc,double openRisk)
+               int posCount,int netDir,OmegaCapital &cap,int campaigns,int maxConc,double openRisk,
+               const Campaign &camp)
      {
       if(!InpShowDashboard) return;
       int r=0;
@@ -3286,6 +3288,8 @@ public:
       Row(r++, StringFormat("Drawdown d %.2f%%  w %.2f%%  h %.2f%%", cap.DDd(), cap.DDw(), cap.DDh()), FG);
       Row(r++, StringFormat("Exposure open %.2f%% / cap %.2f%%", openRisk, InpMaxPortfolioRisk), FG);
       Row(r++, StringFormat("Position %d  %s   campaigns %d/%d", posCount, posCount>0?(netDir==1?"LONG":"SHORT"):"flat", campaigns, maxConc), posCount>0?DirCol(netDir):DIM);
+      if(camp.active || posCount>0)
+         Row(r++, StringFormat("Targets  T1 %s%s  T2 %s%s  T3 %s", PxS(camp.tp1), camp.tp1Done?" OK":"", PxS(camp.tp2), camp.tp2Done?" OK":"", PxS(camp.tp3)), CYA);
 
       //--- ACTION — what the organism is about to do
       string act; color ac;
@@ -3347,18 +3351,51 @@ public:
    bool   HasPosition(){ return m_exec.CountActive()>0; }
    double Mid(){ return (SymbolInfoDouble(m_sym,SYMBOL_ASK)+SymbolInfoDouble(m_sym,SYMBOL_BID))/2.0; }
 
-   void Record(const Opportunity &op,ulong tk,double vol)
+   void Record(const Opportunity &op,ulong tk,double vol,double t1,double t2,double t3)
      {
       m_camp.active=true; m_camp.dir=op.direction; m_camp.entry=op.entry; m_camp.initialSL=op.invalidation;
       m_camp.initTarget=op.target; m_camp.origVol=vol; m_camp.family=op.family; m_camp.mgmt=op.mgmt;
       m_camp.partialDone=false; m_camp.adds=0; m_camp.ticket=tk;
+      m_camp.tp1=t1; m_camp.tp2=t2; m_camp.tp3=t3; m_camp.tp1Done=false; m_camp.tp2Done=false;
+     }
+   //--- build the TP ladder from the invisible-network path + attack sequence,
+   //    falling back to measured-move ATR multiples. Targets ordered by distance.
+   void BuildTPLadder(int dir,double entry,double atr,double &t1,double &t2,double &t3)
+     {
+      t1=NA_VAL; t2=NA_VAL; t3=NA_VAL;
+      double cand[6]; int cn=0;
+      if(!IsNa(m_f60.path.toPx))     cand[cn++]=m_f60.path.toPx;
+      if(!IsNa(m_f60.path.thenPx))   cand[cn++]=m_f60.path.thenPx;
+      if(!IsNa(m_f60.path.futCurPx)) cand[cn++]=m_f60.path.futCurPx;
+      if(!IsNa(m_f60.atkT1))         cand[cn++]=m_f60.atkT1;
+      if(!IsNa(m_f60.atkT2))         cand[cn++]=m_f60.atkT2;
+      if(!IsNa(m_f60.atkT3))         cand[cn++]=m_f60.atkT3;
+      double picks[]; int pn=0;
+      for(int i=0;i<cn;i++)
+        { double v2=cand[i]; bool ok=(dir==1 && v2>entry+atr*0.3)||(dir==-1 && v2<entry-atr*0.3);
+          if(ok){ ArrayResize(picks,pn+1); picks[pn++]=v2; } }
+      for(int a=1;a<pn;a++){ double k=picks[a]; int b=a-1; while(b>=0 && MathAbs(picks[b]-entry)>MathAbs(k-entry)){ picks[b+1]=picks[b]; b--; } picks[b+1]=k; }
+      if(pn>0) t1=picks[0];
+      for(int i=1;i<pn;i++) if(IsNa(t2) && MathAbs(picks[i]-Nz(t1,entry))>atr*0.5) t2=picks[i];
+      for(int i=2;i<pn;i++) if(IsNa(t3) && !IsNa(t2) && MathAbs(picks[i]-t2)>atr*0.5) t3=picks[i];
+      if(IsNa(t1)) t1=(dir==1)?entry+atr*1.5:entry-atr*1.5;
+      if(IsNa(t2)) t2=(dir==1)?entry+atr*3.0:entry-atr*3.0;
+      if(IsNa(t3)) t3=(dir==1)?entry+atr*5.0:entry-atr*5.0;
      }
    void ManagePosition()
      {
       if(m_exec.CountActive()==0){ m_camp.active=false; return; }
       PositionVerdict v; PositionIntelligence::Evaluate(m_f60,m_obs,m_camp,Mid(),v);
       if(v.doExit){ m_exec.CloseAll(v.reason); m_camp.active=false; return; }
-      if(v.doPartial && !m_camp.partialDone){ m_exec.ClosePartial(0.5,v.reason); m_camp.partialDone=true; }
+      double px=Mid(); int dir=m_camp.dir;
+      //--- staged partials along the TP ladder (network/attack targets):
+      //    TP1 → bank ~1/3 + move SL to breakeven; TP2 → bank ~1/2 of remainder
+      //    + move SL to TP1; runner rides to TP3 (broker TP) / terminal.
+      if(!m_camp.tp1Done && !IsNa(m_camp.tp1) && (dir==1?px>=m_camp.tp1:px<=m_camp.tp1))
+        { m_exec.ClosePartial(0.34,"TP1 hit"); m_camp.tp1Done=true; m_camp.partialDone=true; m_exec.ModifySL(m_camp.entry); }
+      else if(m_camp.tp1Done && !m_camp.tp2Done && !IsNa(m_camp.tp2) && (dir==1?px>=m_camp.tp2:px<=m_camp.tp2))
+        { m_exec.ClosePartial(0.50,"TP2 hit"); m_camp.tp2Done=true; if(!IsNa(m_camp.tp1)) m_exec.ModifySL(m_camp.tp1); }
+      else if(v.doPartial && !m_camp.partialDone){ m_exec.ClosePartial(0.5,v.reason); m_camp.partialDone=true; }
       if(v.doTrail && !IsNa(v.newSL)) m_exec.ModifySL(v.newSL);
      }
    void ConsiderEntry(OmegaCapital &cap,int concurrentActive,double exposureBudget)
@@ -3386,15 +3423,19 @@ public:
          if(concurrentActive>=InpMaxConcurrent) return;
          if(exposureBudget<=0.05) return;
          double convFrac=op.conviction/100.0*(0.5+0.5*triFactor);
+         double entry=(op.direction==1)?SymbolInfoDouble(m_sym,SYMBOL_ASK):SymbolInfoDouble(m_sym,SYMBOL_BID);
+         double t1,t2,t3; BuildTPLadder(op.direction,entry,atr,t1,t2,t3);
          ulong tk; double vol;
-         if(m_exec.Open(op,atr,convFrac,cap.Throttle(),exposureBudget,tk,vol)) Record(op,tk,vol);
+         if(m_exec.Open(op,atr,convFrac,cap.Throttle(),exposureBudget,t1,t2,t3,tk,vol)) Record(op,tk,vol,t1,t2,t3);
         }
       else if(posDir==op.direction)
         {
          if(InpAllowAdds && !triVeto && m_camp.adds<InpMaxAddsPerCampaign && (op.family==FAM_CONTINUATION||op.family==FAM_EXPANSION)
             && op.conviction>=(double)InpMinConviction+5.0 && exposureBudget>0.05)
            { double convFrac=op.conviction/100.0*0.7*(0.5+0.5*triFactor);
-             ulong tk; double vol; if(m_exec.Open(op,atr,convFrac,cap.Throttle(),exposureBudget,tk,vol)) m_camp.adds++; }
+             double entry=(op.direction==1)?SymbolInfoDouble(m_sym,SYMBOL_ASK):SymbolInfoDouble(m_sym,SYMBOL_BID);
+             double t1,t2,t3; BuildTPLadder(op.direction,entry,atr,t1,t2,t3);
+             ulong tk; double vol; if(m_exec.Open(op,atr,convFrac,cap.Throttle(),exposureBudget,t1,t2,t3,tk,vol)) m_camp.adds++; }
         }
      }
    void Process(OmegaCapital &cap,int concurrentActive,double exposureBudget)
@@ -3430,7 +3471,7 @@ public:
    void RenderDashboard(Dashboard &dash,OmegaCapital &cap,int campaigns,int maxConc,double openRisk)
      {
       dash.Render(m_sym, m_f60, m_obs, m_trinity, m_best, m_meta, m_haveScan,
-                  m_exec.CountActive(), m_exec.NetDir(), cap, campaigns, maxConc, openRisk);
+                  m_exec.CountActive(), m_exec.NetDir(), cap, campaigns, maxConc, openRisk, m_camp);
      }
   };
 
