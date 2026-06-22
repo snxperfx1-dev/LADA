@@ -76,6 +76,7 @@ input double InpWeeklyLimitPct   = 8.0;     // Weekly drawdown limit %
 input double InpHardLimitPct     = 15.0;    // Hard kill-switch drawdown %
 input double InpMaxPortfolioRisk = 2.0;     // Max aggregate open risk %
 input bool   InpCentAccount      = false;   // Cent account (equity/100)
+input bool   InpCorrelationGuard = true;    // Reduce size when correlated same-dir risk stacks
 
 input group "=== Execution ==="
 input int    InpSlippagePoints   = 30;      // Max slippage (points)
@@ -2980,6 +2981,27 @@ public:
         }
       return OmegaMath::Pct(risk,eq);
      }
+   //--- correlation guard: scale size down when correlated SAME-direction risk is
+   //    already open (proxy: shared currency token). Each correlated leg ~×0.6.
+   static double CorrelationMult(string sym,int dir,long magic)
+     {
+      if(dir==0) return 1.0;
+      string baseA=StringSubstr(sym,0,3), quoteA=(StringLen(sym)>=6)?StringSubstr(sym,3,3):"";
+      int corr=0;
+      for(int i=PositionsTotal()-1;i>=0;i--)
+        {
+         ulong tk=PositionGetTicket(i); if(tk==0) continue;
+         if((long)PositionGetInteger(POSITION_MAGIC)!=magic) continue;
+         string psym=PositionGetString(POSITION_SYMBOL); if(psym==sym) continue;      // same symbol = adds, not correlation
+         int pdir=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY)?1:-1;
+         if(pdir!=dir) continue;                                                       // opposite dir = hedge, not stacking
+         string baseB=StringSubstr(psym,0,3), quoteB=(StringLen(psym)>=6)?StringSubstr(psym,3,3):"";
+         bool shared=(baseA==baseB)||(baseA==quoteB)||(quoteA==baseB)||(quoteA!=""&&quoteA==quoteB);
+         if(shared) corr++;
+        }
+      double m=1.0; for(int k=0;k<corr;k++) m*=0.6;
+      return MathMax(0.3,m);
+     }
   };
 
 #endif // __HYPEROMEGA_RISK_MQH__
@@ -3121,10 +3143,18 @@ public:
       bool phaseTerminal  = OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Liquidation")||OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Terminal");
       bool rotationAgainst= (o.rie_rotationProb>70.0 && o.rie_transferDir!=0 && o.rie_transferDir!=dir);
       bool lifeDead       = (s.life<=32.0);   // Pine "campaign DIED" — ownership transferring
+      bool chainDeath     = (s.wholeChainLife<30.0);                          // whole lineage bled out
+      bool residualCollapse = (s.re_residualScore<10.0 && !s.progressing && s.fce_maturity>60.0); // no gas left, late
 
       if((ownerFlipped && lowVitality) || (structFlipped && rotationAgainst) || (resolvedAgainst && phaseTerminal)
-         || (lifeDead && (ownerFlipped || rotationAgainst)))
-        { v.doExit=true; v.reason="campaign invalidated (owner/struct flip · exhaustion · terminal · life dead)"; return; }
+         || (lifeDead && (ownerFlipped || rotationAgainst)) || chainDeath || residualCollapse)
+        {
+         v.doExit=true;
+         v.reason = chainDeath ? "chain death (whole lineage bled out)"
+                  : residualCollapse ? "residual collapse (no gas left, late cycle)"
+                  : "campaign invalidated (owner/struct flip · exhaustion · terminal · life dead)";
+         return;
+        }
       if(rotationAgainst && resolvedAgainst)
         { v.doReverse=true; v.reason="control transfer against position"; }
       if(!c.partialDone)
@@ -3511,7 +3541,8 @@ public:
          if(triVeto){ OmegaLogger::Warn("RISK",m_sym+" Trinity override — fresh entry vetoed (low life/confidence)"); return; }
          if(concurrentActive>=InpMaxConcurrent) return;
          if(exposureBudget<=0.05) return;
-         double convFrac=op.conviction/100.0*(0.5+0.5*triFactor);
+         double corr=InpCorrelationGuard?OmegaRisk::CorrelationMult(m_sym,op.direction,InpMagic):1.0;
+         double convFrac=op.conviction/100.0*(0.5+0.5*triFactor)*corr;
          double entry=(op.direction==1)?SymbolInfoDouble(m_sym,SYMBOL_ASK):SymbolInfoDouble(m_sym,SYMBOL_BID);
          double t1,t2,t3; BuildTPLadder(op.direction,entry,atr,t1,t2,t3);
          ulong tk; double vol;
@@ -3521,7 +3552,7 @@ public:
         {
          if(InpAllowAdds && !triVeto && m_camp.adds<InpMaxAddsPerCampaign && (op.family==FAM_CONTINUATION||op.family==FAM_EXPANSION)
             && op.conviction>=(double)InpMinConviction+5.0 && exposureBudget>0.05)
-           { double convFrac=op.conviction/100.0*0.7*(0.5+0.5*triFactor);
+           { double convFrac=op.conviction/100.0*0.7*(0.5+0.5*triFactor)*(InpCorrelationGuard?OmegaRisk::CorrelationMult(m_sym,op.direction,InpMagic):1.0);
              double entry=(op.direction==1)?SymbolInfoDouble(m_sym,SYMBOL_ASK):SymbolInfoDouble(m_sym,SYMBOL_BID);
              double t1,t2,t3; BuildTPLadder(op.direction,entry,atr,t1,t2,t3);
              ulong tk; double vol; if(m_exec.Open(op,atr,convFrac,cap.Throttle(),exposureBudget,t1,t2,t3,tk,vol)) m_camp.adds++; }
