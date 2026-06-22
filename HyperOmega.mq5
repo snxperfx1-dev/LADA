@@ -68,7 +68,7 @@ input bool   InpAllowAdds        = true;    // Allow continuation adds
 input int    InpMaxAddsPerCampaign = 2;     // Max adds per campaign
 input bool   InpUseBeliefCloud   = true;    // Fold belief cloud (Execution Probability) into conviction
 input bool   InpSenseeiEntry     = true;    // Senseei (phases+lifecycle+meta) is a PRIMARY entry driver
-input double InpSenseeiMinLife   = 45.0;    // Min lifecycle 'life' for a Senseei-driven entry
+input double InpSenseeiMinLife   = 35.0;    // Min lifecycle 'life' for a Senseei-driven entry (STRONG reads relax this)
 input double InpSenseeiMaxThreat = 50.0;    // Max Senseei threat to allow a Senseei entry
 input bool   InpNetworkGatesEntry= false;   // Invisible-network pressure may TRIGGER entries (false = path/coords only)
 
@@ -2851,27 +2851,40 @@ public:
          string famCanon=F60FamS(s.tfPhase[TF_CANON]);
          bool phaseAlive = famCanon!="Terminal" && famCanon!="Liquidation"
                          && !OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Absorption");
-         bool lifeAlive  = s.life>=InpSenseeiMinLife;       // lifecycle confirm
+         bool strong = (meta.opportunity=="STRONG"||meta.opportunity=="EXCEPTIONAL");
+         // lifecycle confirm — STRONG/EXCEPTIONAL reads relax the floor (Senseei is
+         // authoritative; a weak OMEGA life must not silently veto a strong call),
+         // but never below the 'alive' line (~20, well above the 32 death cutoff).
+         double lifeFloor = strong ? MathMax(InpSenseeiMinLife-15.0,20.0) : InpSenseeiMinLife;
+         bool lifeAlive = s.life>=lifeFloor;
          // ENTRY WINDOW = TRANSITION stage (same signal OppStage uses for OPP_TRANSITION).
-         // STRONG/EXCEPTIONAL Senseei reads may also fire outside a transition so a
+         // STRONG/EXCEPTIONAL reads may also fire outside a transition so a
          // high-conviction call isn't missed waiting for one.
          bool transition = OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Transition")
                          || (o.rie_rotationProb>60.0 && o.rie_transferDir!=0)
                          || s.treeTransferDir!=0;
-         bool strong = (meta.opportunity=="STRONG"||meta.opportunity=="EXCEPTIONAL");
          if(phaseAlive && lifeAlive && (transition || strong))
            {
-            // target = network path coordinate, else target engine, else node, else ATR projection
+            // ROBUST GEOMETRY — a degenerate observer stop/target must not zero the
+            // asymmetry. Stop: structure invalidation, but capped to a sane 1.5 ATR
+            // (and floored off 0.3 ATR). Target: path/te coordinate if it's a real
+            // leg the right side of price, else a 3 ATR projection.
+            double atr=MathMax(s.atr,1e-10);
+            double stop=o.ie2_inv;
+            double maxRisk=atr*1.5;
+            if(IsNa(stop) || MathAbs(close-stop)>maxRisk || MathAbs(close-stop)<atr*0.3)
+               stop=(dir==1)?close-maxRisk:close+maxRisk;
             double tgt=!IsNa(s.path.toPx)?s.path.toPx
                       :!IsNa(o.te_target)?o.te_target
                       :((dir==1)?s.nodeAbove:s.nodeBelow);
-            if(IsNa(tgt)) tgt=(dir==1)?close+s.atr*2.5:close-s.atr*2.5;
+            bool tgtBad=IsNa(tgt) || ((dir==1)?(tgt<=close+atr*1.5):(tgt>=close-atr*1.5));
+            if(tgtBad) tgt=(dir==1)?close+atr*3.0:close-atr*3.0;
             // conviction IS the senseei (oppScore + confidence) tempered by life.
             // Only the absorption damper applies (a real stand-down signal); the
             // tqe quality GATE is NOT stacked on (tqeVeto still hard-blocks <20),
             // and Make's senseeiDriven flag stops the OMEGA owner from crushing it.
             double conv=meta.oppScore*0.55+meta.confidence*0.30+s.life*0.15;
-            cand[n++]=Make(FAM_SENSEEI,TF_CANON,dir,close,tgt,o.ie2_inv,conv*absDamp,s,true);
+            cand[n++]=Make(FAM_SENSEEI,TF_CANON,dir,close,tgt,stop,conv*absDamp,s,true);
            }
         }
 
