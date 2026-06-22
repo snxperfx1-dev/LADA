@@ -213,6 +213,27 @@ enum ENUM_OMEGA_SESSION
 bool   IsNa(double v)            { return (v >= DBL_MAX * 0.5); }
 double Nz(double v, double fb=0) { return IsNa(v) ? fb : v; }
 
+//=== Invisible-Network path projection (likely / alternate / counter) ==========
+//   Filled by NetworkEngine::ComputePath, read by the decision layer + dashboard.
+struct NetworkPath
+  {
+   double primaryConf, altConf, counterConf;
+   double toPx, thenPx, altPx, fromPx, ctrPx;
+   int    toWt, toDir, thenWt, thenDir, altWt, altDir, fromWt, fromDir, ctrWt, ctrDir;
+   double futCurPx, futAltPx; bool futCurNode, futAltNode;
+   double fezHi, fezLo; int fezHiW, fezLoW;
+   int    pathLen;
+   string route;        // e.g. "Price -> H1 -> H4 -> D"
+   void Reset()
+     {
+      primaryConf=altConf=counterConf=0;
+      toPx=thenPx=altPx=fromPx=ctrPx=DBL_MAX;
+      toWt=toDir=thenWt=thenDir=altWt=altDir=fromWt=fromDir=ctrWt=ctrDir=0;
+      futCurPx=futAltPx=DBL_MAX; futCurNode=futAltNode=false;
+      fezHi=fezLo=DBL_MAX; fezHiW=fezLoW=0; pathLen=0; route="—";
+     }
+  };
+
 //=== Math helpers ==================================================
 class OmegaMath
   {
@@ -471,6 +492,9 @@ struct F60State
 
    //=== master-vote raw inputs (read by MCE / HyperIntelligence) ====
    int    waveDir, stackDir;
+
+   //=== Invisible-Network path (likely / alternate / counter / future) ===
+   NetworkPath path;
   };
 
 #endif // __HYPEROMEGA_F60STATE_MQH__
@@ -1092,6 +1116,104 @@ public:
    bool   FUValid(int idx) const { return m_fu[idx].o_valid; }
    int    FUDir(int idx)   const { return m_fu[idx].o_dir; }
    double FUScore(int idx) const { return m_fu[idx].o_score; }
+
+   //=== INVISIBLE-NETWORK PATH (port of Pine f_pathNodes / f_htfNode) =========
+   string WtTf(int wt) const { return wt==9?"MN":wt==8?"W":wt==7?"D":wt==6?"H4":wt==5?"H1":wt==4?"M15":wt==3?"M5":wt==2?"M3":"M1"; }
+
+   //--- eligible OPEN nodes on one side of price, sorted nearest-first.
+   //    aheadSide=true → bias direction (where price is GOING); false → trail.
+   int PathNodes(bool aheadSide,double close,int &out[]) const
+     {
+      ArrayResize(out,0);
+      int sz=ArraySize(m_nPx);
+      for(int i=0;i<sz;i++)
+        {
+         double np=m_nPx[i];
+         bool ahead = (netBias==1)? np>close : np<close;
+         if(m_nState[i]!=2 && Auth(i)>=InpAuthMin && (aheadSide?ahead:!ahead))
+           { int k=ArraySize(out); ArrayResize(out,k+1); out[k]=i; }
+        }
+      for(int a=1;a<ArraySize(out);a++)   // insertion sort by |close-px| asc
+        {
+         int key=out[a]; double kd=MathAbs(close-m_nPx[key]); int b=a-1;
+         while(b>=0 && MathAbs(close-m_nPx[out[b]])>kd){ out[b+1]=out[b]; b--; }
+         out[b+1]=key;
+        }
+      return ArraySize(out);
+     }
+
+   //--- highest-TF objective node on one side (for the FUTURE story); skip=excl.
+   int HtfNode(bool ahead,int skip,double close) const
+     {
+      int best=-1; double rank=-1.0; int sz=ArraySize(m_nPx);
+      for(int i=0;i<sz;i++)
+        {
+         if(i==skip) continue;
+         double np=m_nPx[i];
+         bool onSide = (netBias==-1)? (ahead? np<close : np>close) : (ahead? np>close : np<close);
+         if(onSide){ double r2=m_nWt[i]*1000.0+Auth(i); if(r2>rank){ rank=r2; best=i; } }
+        }
+      return best;
+     }
+
+   //--- compute the full path projection into p (likely · alt · counter · future · FEZ)
+   void ComputePath(double close,double atr,NetworkPath &p)
+     {
+      p.Reset();
+      int sz=ArraySize(m_nPx);
+      double fezHiA=0,fezLoA=0,topAuth=0; int aligned=0,total=0;
+      for(int i=0;i<sz;i++)
+        {
+         if(m_nState[i]==2) continue;
+         double a=Auth(i); if(a<InpAuthMin) continue;
+         double np=m_nPx[i];
+         total++; if(m_nDir[i]==netBias && netBias!=0) aligned++;
+         if(a>topAuth) topAuth=a;
+         if(np>close && a>fezHiA){ fezHiA=a; p.fezHi=np; p.fezHiW=m_nWt[i]; }
+         if(np<close && a>fezLoA){ fezLoA=a; p.fezLo=np; p.fezLoW=m_nWt[i]; }
+        }
+      double routeConf=(netBias==0||total==0)?0.0
+                       :MathMin(100.0, topAuth*0.5 + ((double)aligned/MathMax(total,1)*100.0)*0.5);
+      p.primaryConf = routeConf;
+      p.altConf     = MathMax(0.0,100.0-routeConf)*0.6;
+      p.counterConf = MathMax(0.0,100.0-MathRound(routeConf)-MathRound(p.altConf));
+
+      int fwd[]; int bwd[];
+      PathNodes(true, close, fwd);
+      PathNodes(false,close, bwd);
+      p.pathLen=ArraySize(fwd);
+      int toIdx  =ArraySize(fwd)>0?fwd[0]:-1;
+      int thenIdx=ArraySize(fwd)>1?fwd[1]:-1;
+      int altIdx =ArraySize(fwd)>2?fwd[2]:thenIdx;
+      int fromIdx=ArraySize(bwd)>0?bwd[0]:-1;
+      int ctrIdx =ArraySize(bwd)>1?bwd[1]:fromIdx;
+      if(toIdx>=0){   p.toPx=m_nPx[toIdx];     p.toWt=m_nWt[toIdx];     p.toDir=m_nDir[toIdx]; }
+      if(thenIdx>=0){ p.thenPx=m_nPx[thenIdx]; p.thenWt=m_nWt[thenIdx]; p.thenDir=m_nDir[thenIdx]; }
+      if(altIdx>=0){  p.altPx=m_nPx[altIdx];   p.altWt=m_nWt[altIdx];   p.altDir=m_nDir[altIdx]; }
+      if(fromIdx>=0){ p.fromPx=m_nPx[fromIdx]; p.fromWt=m_nWt[fromIdx]; p.fromDir=m_nDir[fromIdx]; }
+      if(ctrIdx>=0){  p.ctrPx=m_nPx[ctrIdx];   p.ctrWt=m_nWt[ctrIdx];   p.ctrDir=m_nDir[ctrIdx]; }
+
+      string route="Price";
+      for(int i=0;i<ArraySize(fwd);i++) route+=" -> "+WtTf(m_nWt[fwd[i]]);
+      p.route=route;
+
+      //--- future projection: a higher-TF node ≥2·ATR beyond the near target,
+      //    else a measured-move extension of the leg.
+      double projMin=atr*2.0;
+      double toPx2 =(toIdx>=0)?m_nPx[toIdx]:close;
+      double ctrPx2=(ctrIdx>=0)?m_nPx[ctrIdx]:close;
+      int deepCur=ArraySize(fwd)>0?fwd[ArraySize(fwd)-1]:-1; double endCur=(deepCur>=0)?m_nPx[deepCur]:close;
+      int deepAlt=ArraySize(bwd)>0?bwd[ArraySize(bwd)-1]:-1; double endAlt=(deepAlt>=0)?m_nPx[deepAlt]:close;
+      int futCn=HtfNode(true,toIdx,close);
+      int futAn=HtfNode(false,ctrIdx,close);
+      bool futCisNode=futCn>=0 && (netBias==-1? m_nPx[futCn]<toPx2-projMin : m_nPx[futCn]>toPx2+projMin);
+      bool futAisNode=futAn>=0 && (netBias==-1? m_nPx[futAn]>ctrPx2+projMin : m_nPx[futAn]<ctrPx2-projMin);
+      double spanC=MathMax(MathAbs(close-endCur),projMin);
+      double spanA=MathMax(MathAbs(close-endAlt),projMin);
+      p.futCurPx=futCisNode? m_nPx[futCn] : (netBias==-1? endCur-spanC : endCur+spanC);
+      p.futAltPx=futAisNode? m_nPx[futAn] : (netBias==-1? endAlt+spanA : endAlt-spanA);
+      p.futCurNode=futCisNode; p.futAltNode=futAisNode;
+     }
   };
 
 #endif // __HYPEROMEGA_F60_NETWORK_MQH__
@@ -2162,6 +2284,8 @@ public:
       s.netBias=m_net.netBias; s.pdir=m_net.pdir; s.eligibleNodes=m_net.eligibleNodes; s.nodeCount=m_net.nodeCount;
       s.pressure=m_net.pressure; s.bullAuth=m_net.bullAuth; s.bearAuth=m_net.bearAuth;
       s.nodeAbove=m_net.NearestNode(close,1,0); s.nodeBelow=m_net.NearestNode(close,-1,0);
+      //--- invisible-network path projection (likely / alternate / counter / future)
+      m_net.ComputePath(close, atr, s.path);
       //--- fractal stack
       m_fractal.Compute(dirs,9); s.fractalStackDir=m_fractal.dir; s.fractalStackScore=m_fractal.score;
       //--- structBias (M5 strict HH/HL)
@@ -2670,10 +2794,10 @@ public:
           double conv=o.rie_rotationProb*0.55+(s.treeTransferDir!=0?20.0:0.0)+(s.structBias==dir?15.0:0.0)
                       +(InpUseBeliefCloud?s.retrBelief*0.15:0.0)-conflictPenalty*0.5;
           cand[n++]=Make(FAM_ROTATION,TF_CANON,dir,close,tgt,o.ie2_inv,conv*g,s); }
-      // 5) NETWORK
+      // 5) NETWORK — routes to the next node on the invisible-network path
       if(s.eligibleNodes>0 && MathAbs(s.pressure)>25.0 && s.pdir!=0)
-        { int dir=s.pdir; double tgt=(dir==1)?s.nodeAbove:s.nodeBelow;
-          double conv=MathAbs(s.pressure)*0.45+o.frz_attractorScore*0.30+MathMin(s.eligibleNodes*4.0,25.0)-conflictPenalty;
+        { int dir=s.pdir; double tgt=!IsNa(s.path.toPx)?s.path.toPx:((dir==1)?s.nodeAbove:s.nodeBelow);
+          double conv=MathAbs(s.pressure)*0.40+o.frz_attractorScore*0.25+MathMin(s.eligibleNodes*4.0,25.0)+s.path.primaryConf*0.15-conflictPenalty;
           cand[n++]=Make(FAM_NETWORK,TF_CANON,dir,close,tgt,o.ie2_inv,conv*g,s); }
       // 6) FLIP-ZONE
       if(od!=0 && o.frz_approachQ>55.0)
@@ -3039,6 +3163,53 @@ private:
       ObjectSetInteger(0,nm,OBJPROP_SELECTABLE,false);
       ObjectSetInteger(0,nm,OBJPROP_HIDDEN,true);
      }
+   //--- price-chart path drawing (OBJ_TREND segments + FEZ box + tags) =========
+   void Seg(string nm,datetime t1,double p1,datetime t2,double p2,color clr,int w,ENUM_LINE_STYLE st)
+     {
+      if(ObjectFind(0,nm)<0) ObjectCreate(0,nm,OBJ_TREND,0,t1,p1,t2,p2);
+      ObjectSetInteger(0,nm,OBJPROP_TIME,0,t1); ObjectSetDouble(0,nm,OBJPROP_PRICE,0,p1);
+      ObjectSetInteger(0,nm,OBJPROP_TIME,1,t2); ObjectSetDouble(0,nm,OBJPROP_PRICE,1,p2);
+      ObjectSetInteger(0,nm,OBJPROP_COLOR,clr); ObjectSetInteger(0,nm,OBJPROP_WIDTH,w);
+      ObjectSetInteger(0,nm,OBJPROP_STYLE,st); ObjectSetInteger(0,nm,OBJPROP_RAY_RIGHT,false);
+      ObjectSetInteger(0,nm,OBJPROP_BACK,false); ObjectSetInteger(0,nm,OBJPROP_SELECTABLE,false); ObjectSetInteger(0,nm,OBJPROP_HIDDEN,true);
+     }
+   void PBox(string nm,datetime t1,double p1,datetime t2,double p2,color bg)
+     {
+      if(ObjectFind(0,nm)<0) ObjectCreate(0,nm,OBJ_RECTANGLE,0,t1,p1,t2,p2);
+      ObjectSetInteger(0,nm,OBJPROP_TIME,0,t1); ObjectSetDouble(0,nm,OBJPROP_PRICE,0,p1);
+      ObjectSetInteger(0,nm,OBJPROP_TIME,1,t2); ObjectSetDouble(0,nm,OBJPROP_PRICE,1,p2);
+      ObjectSetInteger(0,nm,OBJPROP_COLOR,bg); ObjectSetInteger(0,nm,OBJPROP_FILL,true);
+      ObjectSetInteger(0,nm,OBJPROP_BACK,true); ObjectSetInteger(0,nm,OBJPROP_SELECTABLE,false); ObjectSetInteger(0,nm,OBJPROP_HIDDEN,true);
+     }
+   void Tag(string nm,datetime t,double px,string txt,color clr)
+     {
+      if(ObjectFind(0,nm)<0) ObjectCreate(0,nm,OBJ_TEXT,0,t,px);
+      ObjectSetInteger(0,nm,OBJPROP_TIME,0,t); ObjectSetDouble(0,nm,OBJPROP_PRICE,0,px);
+      ObjectSetString (0,nm,OBJPROP_TEXT," "+txt); ObjectSetInteger(0,nm,OBJPROP_COLOR,clr);
+      ObjectSetInteger(0,nm,OBJPROP_FONTSIZE,MathMax(7,InpDashFont-1)); ObjectSetString(0,nm,OBJPROP_FONT,"Consolas");
+      ObjectSetInteger(0,nm,OBJPROP_ANCHOR,ANCHOR_LEFT); ObjectSetInteger(0,nm,OBJPROP_SELECTABLE,false); ObjectSetInteger(0,nm,OBJPROP_HIDDEN,true);
+     }
+   void DrawPath(const NetworkPath &p)
+     {
+      ObjectsDeleteAll(0, m_pfx+"_P");
+      datetime t0=iTime(_Symbol,_Period,0); if(t0==0) t0=TimeCurrent();
+      int ps=PeriodSeconds(_Period); double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+      datetime t1=t0+(datetime)(ps*8), t2=t0+(datetime)(ps*16), t3=t0+(datetime)(ps*24);
+      if(!IsNa(p.fezHi)&&!IsNa(p.fezLo)) PBox(m_pfx+"_Pfez", t0, p.fezHi, t2, p.fezLo, C'40,30,90');
+      //--- PRIMARY route (solid green): price -> to -> then
+      if(!IsNa(p.toPx))   Seg(m_pfx+"_P0", t0,bid, t1,p.toPx, GRN, 2, STYLE_SOLID);
+      if(!IsNa(p.thenPx)) Seg(m_pfx+"_P1", t1,Nz(p.toPx,bid), t2,p.thenPx, GRN, 2, STYLE_SOLID);
+      //--- ALTERNATE (amber dashed) + FUTURE projection (cyan dotted)
+      if(!IsNa(p.altPx))    Seg(m_pfx+"_P2", t0,bid, t1,p.altPx, AMB, 1, STYLE_DASH);
+      if(!IsNa(p.futCurPx)) Seg(m_pfx+"_P3", t2, IsNa(p.thenPx)?Nz(p.toPx,bid):p.thenPx, t3, p.futCurPx, CYA, 1, STYLE_DOT);
+      if(!IsNa(p.toPx))    Tag(m_pfx+"_Pl0", t1, p.toPx, StringFormat("PRIMARY %.0f%%", p.primaryConf), GRN);
+      if(!IsNa(p.altPx))   Tag(m_pfx+"_Pl1", t1, p.altPx, StringFormat("ALT %.0f%%", p.altConf), AMB);
+      if(!IsNa(p.futCurPx))Tag(m_pfx+"_Pl2", t3, p.futCurPx, p.futCurNode?"FUTURE (HTF)":"FUTURE (proj)", CYA);
+     }
+   //--- path formatters
+   static string WtTfN(int wt){ return wt==9?"MN":wt==8?"W":wt==7?"D":wt==6?"H4":wt==5?"H1":wt==4?"M15":wt==3?"M5":wt==2?"M3":"M1"; }
+   static string PxS(double px){ return IsNa(px)?"—":DoubleToString(px,_Digits); }
+   static string NodeL(int wt,int dir,double px){ return IsNa(px)?"—":WtTfN(wt)+(dir==1?"▲":dir==-1?"▼":"·")+DoubleToString(px,_Digits); }
    //--- formatters
    static string Arrow(int d){ return d==1?"▲":d==-1?"▼":"—"; }
    static string Gauge(double pct){ int n=(int)MathMax(0,MathMin(8,MathRound(pct/12.5))); string s=""; for(int i=0;i<8;i++) s+=(i<n?"▰":"▱"); return s; }
@@ -3101,6 +3272,14 @@ public:
                        : "no qualified setup";
       Row(r++, "Setup    "+setupTx, (haveScan&&best.valid)?GRN:DIM);
 
+      //=== NETWORK PATH (likely / alternate / counter / future) =====
+      Row(r++, "── NETWORK PATH ────────────────────", DIM);
+      Row(r++, StringFormat("Primary  %.0f%%  %s", s.path.primaryConf, s.path.route), GRN);
+      Row(r++, "  -> "+NodeL(s.path.toWt,s.path.toDir,s.path.toPx)+"  -> "+NodeL(s.path.thenWt,s.path.thenDir,s.path.thenPx), FG);
+      Row(r++, StringFormat("Alt %.0f%% %s   Ctr %.0f%% %s", s.path.altConf, NodeL(s.path.altWt,s.path.altDir,s.path.altPx), s.path.counterConf, NodeL(s.path.ctrWt,s.path.ctrDir,s.path.ctrPx)), AMB);
+      Row(r++, "Future   cur "+PxS(s.path.futCurPx)+(s.path.futCurNode?" (HTF)":" (proj)")+"   alt "+PxS(s.path.futAltPx), DIM);
+      Row(r++, "FEZ      "+PxS(s.path.fezLo)+" <-> "+PxS(s.path.fezHi), CYA);
+
       //=== DOING ====================================================
       Row(r++, "── DOING (execution) ───────────────", DIM);
       Row(r++, StringFormat("Capital  %s  throttle %.2f", CapName(cap.State()), cap.Throttle()), CapCol(cap.State()));
@@ -3119,6 +3298,7 @@ public:
       Row(r++, "Action   "+act, ac);
 
       Bg(r);
+      DrawPath(s.path);
       ChartRedraw(0);
      }
   };
