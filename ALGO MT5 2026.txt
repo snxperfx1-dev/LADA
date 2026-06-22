@@ -61,8 +61,8 @@ input int    InpLiqSweepLookback = 10;      // Liquidity sweep lookback bars
 input bool   InpRequireLiqSweep  = true;    // Require liquidity sweep for true CHoCH
 
 input group "=== HyperIntelligence ==="
-input int    InpMinConviction    = 55;      // Min opportunity conviction to act
-input double InpMinAsymmetry     = 1.3;     // Min reward:risk*prob to act
+input int    InpMinConviction    = 48;      // Min opportunity conviction to act
+input double InpMinAsymmetry     = 1.1;     // Min reward:risk*prob to act
 input bool   InpAllowCountertrend= true;    // Allow counter-trend (reduced) entries
 input bool   InpAllowAdds        = true;    // Allow continuation adds
 input int    InpMaxAddsPerCampaign = 2;     // Max adds per campaign
@@ -2708,7 +2708,7 @@ private:
       if(fam==FAM_LIQUIDATION||fam==FAM_FLIPZONE) return MGMT_AGGRESSIVE;
       return MGMT_NORMAL;
      }
-   static Opportunity Make(EntryFamily fam,int tfIdx,int dir,double entry,double target,double inv,double conv,const F60State &s)
+   static Opportunity Make(EntryFamily fam,int tfIdx,int dir,double entry,double target,double inv,double conv,const F60State &s,bool senseeiDriven=false)
      {
       Opportunity op;
       op.family=fam; op.tfIdx=tfIdx; op.tf=OmegaTfEnum(tfIdx); op.direction=dir;
@@ -2718,7 +2718,12 @@ private:
       //    (Invisible network is EXCLUDED — it supplies path coordinates, it does
       //    NOT vote on whether to take the trade.) Full agreement lifts conviction.
       int aln=(s.ownerDir==dir?1:0)+(s.fractalStackDir==dir?1:0)+(s.tfDir[TF_CANON]==dir?1:0);
-      conv*=(0.70+(double)aln/3.0*0.45);     // 0.70 (none) .. 1.15 (all three agree)
+      double alnMult=0.70+(double)aln/3.0*0.45;     // 0.70 (none) .. 1.15 (all three agree)
+      //--- A Senseei-driven setup already INTEGRATES owner/fractal/wave into its
+      //    master vote, so the OMEGA-native owner read (the weaker signal) may
+      //    only ADD conviction, never crush it below par.
+      if(senseeiDriven && alnMult<1.0) alnMult=1.0;
+      conv*=alnMult;
       op.conviction=OmegaMath::Clamp(conv,0.0,100.0);
       op.mgmt=PickMgmt(fam,ct,s);
       double atr=MathMax(s.atr,1e-10);
@@ -2847,11 +2852,14 @@ public:
          bool phaseAlive = famCanon!="Terminal" && famCanon!="Liquidation"
                          && !OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Absorption");
          bool lifeAlive  = s.life>=InpSenseeiMinLife;       // lifecycle confirm
-         // ENTRY WINDOW = TRANSITION stage (same signal OppStage uses for OPP_TRANSITION)
+         // ENTRY WINDOW = TRANSITION stage (same signal OppStage uses for OPP_TRANSITION).
+         // STRONG/EXCEPTIONAL Senseei reads may also fire outside a transition so a
+         // high-conviction call isn't missed waiting for one.
          bool transition = OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Transition")
                          || (o.rie_rotationProb>60.0 && o.rie_transferDir!=0)
                          || s.treeTransferDir!=0;
-         if(phaseAlive && lifeAlive && transition)
+         bool strong = (meta.opportunity=="STRONG"||meta.opportunity=="EXCEPTIONAL");
+         if(phaseAlive && lifeAlive && (transition || strong))
            {
             // target = network path coordinate, else target engine, else node, else ATR projection
             double tgt=!IsNa(s.path.toPx)?s.path.toPx
@@ -2859,17 +2867,24 @@ public:
                       :((dir==1)?s.nodeAbove:s.nodeBelow);
             if(IsNa(tgt)) tgt=(dir==1)?close+s.atr*2.5:close-s.atr*2.5;
             // conviction IS the senseei (oppScore + confidence) tempered by life.
-            // NOT multiplied by metaFactor (that would double-count the meta);
-            // tqe quality gate + absorption damper still apply as risk filters.
+            // Only the absorption damper applies (a real stand-down signal); the
+            // tqe quality GATE is NOT stacked on (tqeVeto still hard-blocks <20),
+            // and Make's senseeiDriven flag stops the OMEGA owner from crushing it.
             double conv=meta.oppScore*0.55+meta.confidence*0.30+s.life*0.15;
-            cand[n++]=Make(FAM_SENSEEI,TF_CANON,dir,close,tgt,o.ie2_inv,conv*tqeGate*absDamp,s);
+            cand[n++]=Make(FAM_SENSEEI,TF_CANON,dir,close,tgt,o.ie2_inv,conv*absDamp,s,true);
            }
         }
 
-      best.valid=false; double bestA=-1.0;
-      if(tqeVeto) return false;
-      for(int i=0;i<n;i++) if(cand[i].valid && cand[i].asymmetry>bestA){ bestA=cand[i].asymmetry; best=cand[i]; }
-      return best.valid;
+      best.family=FAM_NONE; best.valid=false; best.conviction=0; best.asymmetry=0; best.direction=0; best.mgmt=MGMT_NORMAL;
+      double bestA=-1.0; int rawIdx=-1; double rawA=-2.0;
+      for(int i=0;i<n;i++)
+        {
+         if(cand[i].asymmetry>rawA){ rawA=cand[i].asymmetry; rawIdx=i; }          // nearest-miss tracker
+         if(cand[i].valid && cand[i].asymmetry>bestA){ bestA=cand[i].asymmetry; best=cand[i]; }
+        }
+      if(!best.valid && rawIdx>=0) best=cand[rawIdx];   // surface the nearest miss for the dashboard
+      if(tqeVeto) best.valid=false;                      // hard quality veto: block trading, keep display
+      return (n>0);                                      // haveScan = candidates existed (so the panel can explain)
      }
 
    //--- opportunity lifecycle stage (Stage 3): where in the entry cycle are we?
@@ -3438,11 +3453,23 @@ public:
       int stg=HyperIntelligence::OppStage(s,o,best,haveScan,meta);
       color sc=(stg==OPP_ATTACK||stg==OPP_EXPANSION)?GRN:(stg==OPP_PREPARE||stg==OPP_SPAWN)?AMB:(stg==OPP_TERMINAL||stg==OPP_TRANSITION)?RED:DIM;
       Row(r++, "Stage    "+HyperIntelligence::OppStageStr(stg), sc);
-      string setupTx = (haveScan && best.valid)
-                       ? StringFormat("%s/%s %s  conv %.0f  asym %.2f", FamilyName(best.family), MgmtName(best.mgmt),
-                                       best.direction==1?"LONG":best.direction==-1?"SHORT":"-", best.conviction, best.asymmetry)
-                       : "no qualified setup";
-      Row(r++, "Setup    "+setupTx, (haveScan&&best.valid)?GRN:DIM);
+      string setupTx;
+      color  setupCol;
+      if(haveScan && best.valid)
+        { setupTx=StringFormat("%s/%s %s  conv %.0f  asym %.2f", FamilyName(best.family), MgmtName(best.mgmt),
+                                best.direction==1?"LONG":best.direction==-1?"SHORT":"-", best.conviction, best.asymmetry);
+          setupCol=GRN; }
+      else if(o.tqe_quality<20.0)
+        { setupTx=StringFormat("TQE VETO (quality %.0f<20) — scan blocked", o.tqe_quality); setupCol=RED; }
+      else if(best.family!=FAM_NONE)
+        { setupTx=StringFormat("near: %s %s conv %.0f%s asym %.2f%s", FamilyName(best.family),
+                                best.direction==1?"L":best.direction==-1?"S":"-",
+                                best.conviction, best.conviction<(double)InpMinConviction?StringFormat("(<%d)",InpMinConviction):"",
+                                best.asymmetry,  best.asymmetry<InpMinAsymmetry?StringFormat("(<%.1f)",InpMinAsymmetry):"");
+          setupCol=AMB; }
+      else
+        { setupTx="no candidate (no family armed)"; setupCol=DIM; }
+      Row(r++, "Setup    "+setupTx, setupCol);
 
       //=== NETWORK PATH (likely / alternate / counter / future) =====
       Row(r++, "── NETWORK PATH (co-pilot) ─────────", DIM);
