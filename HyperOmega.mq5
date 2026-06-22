@@ -69,6 +69,7 @@ input int    InpMaxAddsPerCampaign = 2;     // Max adds per campaign
 input bool   InpUseBeliefCloud   = true;    // Fold belief cloud (Execution Probability) into conviction
 input bool   InpSenseeiEntry     = true;    // Senseei (phases+lifecycle+meta) is a PRIMARY entry driver
 input double InpSenseeiMinLife   = 45.0;    // Min lifecycle 'life' for a Senseei-driven entry
+input double InpSenseeiMaxThreat = 50.0;    // Max Senseei threat to allow a Senseei entry
 input bool   InpNetworkGatesEntry= false;   // Invisible-network pressure may TRIGGER entries (false = path/coords only)
 
 input group "=== Risk / Capital (Omega inheritance) ==="
@@ -86,6 +87,7 @@ input int    InpSlippagePoints   = 30;      // Max slippage (points)
 input double InpMinStopAtr       = 0.75;    // Min stop (ATR multiple)
 input bool   InpTrailStops       = true;    // Trail stop to invalidation
 input bool   InpUseTargetTP      = true;    // Place TP at objective
+input int    InpExitConfirmBars  = 2;       // Bars an invalidation must persist before exiting (constant communication)
 
 input group "=== Diagnostics ==="
 input int    InpWarmupBars       = 600;     // Warmup bars per TF
@@ -2832,9 +2834,12 @@ public:
 
       // 9) SENSEEI — the meta-intelligence is a PRIMARY entry driver (phases +
       //    lifecycle + senseei agree). Direction = Senseei master vote. Gate =
-      //    opportunity GOOD/STRONG/EXCEPTIONAL + life alive + phase not dead.
-      //    The invisible network only SUPPLIES the target coordinate here.
-      if(InpSenseeiEntry && meta.master!=0 &&
+      //    opportunity GOOD/STRONG/EXCEPTIONAL + low threat + life alive + phase
+      //    not dead, AND the opportunity stage is TRANSITION (ownership handing
+      //    over / a new curve taking the wheel) — we enter as price transitions
+      //    into a fresh campaign, NOT chasing it mid-expansion. The invisible
+      //    network only SUPPLIES the target coordinate here.
+      if(InpSenseeiEntry && meta.master!=0 && meta.threat<=InpSenseeiMaxThreat &&
          (meta.opportunity=="GOOD"||meta.opportunity=="STRONG"||meta.opportunity=="EXCEPTIONAL"))
         {
          int dir=meta.master;
@@ -2842,7 +2847,11 @@ public:
          bool phaseAlive = famCanon!="Terminal" && famCanon!="Liquidation"
                          && !OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Absorption");
          bool lifeAlive  = s.life>=InpSenseeiMinLife;       // lifecycle confirm
-         if(phaseAlive && lifeAlive)
+         // ENTRY WINDOW = TRANSITION stage (same signal OppStage uses for OPP_TRANSITION)
+         bool transition = OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Transition")
+                         || (o.rie_rotationProb>60.0 && o.rie_transferDir!=0)
+                         || s.treeTransferDir!=0;
+         if(phaseAlive && lifeAlive && transition)
            {
             // target = network path coordinate, else target engine, else node, else ATR projection
             double tgt=!IsNa(s.path.toPx)?s.path.toPx
@@ -3154,7 +3163,8 @@ struct Campaign
    bool   active; int dir; double entry, initialSL, initTarget, origVol;
    EntryFamily family; MgmtStyle mgmt; bool partialDone; int adds; ulong ticket;
    double tp1, tp2, tp3; bool tp1Done, tp2Done;
-   void Reset(){ active=false; dir=0; entry=0; initialSL=NA_VAL; initTarget=NA_VAL; origVol=0; family=FAM_NONE; mgmt=MGMT_NORMAL; partialDone=false; adds=0; ticket=0; tp1=NA_VAL; tp2=NA_VAL; tp3=NA_VAL; tp1Done=false; tp2Done=false; }
+   int    adverseBars;   // consecutive bars an invalidation has persisted (constant-communication gate)
+   void Reset(){ active=false; dir=0; entry=0; initialSL=NA_VAL; initTarget=NA_VAL; origVol=0; family=FAM_NONE; mgmt=MGMT_NORMAL; partialDone=false; adds=0; ticket=0; tp1=NA_VAL; tp2=NA_VAL; tp3=NA_VAL; tp1Done=false; tp2Done=false; adverseBars=0; }
   };
 struct PositionVerdict { bool doExit, doPartial, doTrail, doReverse; double newSL; string reason; };
 
@@ -3164,7 +3174,8 @@ enum ENUM_CAMP_HEALTH { CH_HEALTHY=0, CH_ACCELERATING=1, CH_STALLING=2, CH_TRANS
 class PositionIntelligence
   {
 public:
-   static void Evaluate(const F60State &s,const ObserverBus &o,const Campaign &c,double curPrice,PositionVerdict &v)
+   static void Evaluate(const F60State &s,const ObserverBus &o,Campaign &c,double curPrice,
+                        const MetaInputs &meta,bool newBar,PositionVerdict &v)
      {
       v.doExit=false; v.doPartial=false; v.doTrail=false; v.doReverse=false; v.newSL=NA_VAL; v.reason="";
       if(!c.active||c.dir==0) return;
@@ -3179,16 +3190,32 @@ public:
       bool chainDeath     = (s.wholeChainLife<30.0);                          // whole lineage bled out
       bool residualCollapse = (s.re_residualScore<10.0 && !s.progressing && s.fce_maturity>60.0); // no gas left, late
 
-      if((ownerFlipped && lowVitality) || (structFlipped && rotationAgainst) || (resolvedAgainst && phaseTerminal)
-         || (lifeDead && (ownerFlipped || rotationAgainst)) || chainDeath || residualCollapse)
+      //--- RAW invalidation read this bar (perception/cognition disagreeing).
+      bool invalidated = (ownerFlipped && lowVitality) || (structFlipped && rotationAgainst)
+                       || (resolvedAgainst && phaseTerminal)
+                       || (lifeDead && (ownerFlipped || rotationAgainst)) || chainDeath || residualCollapse;
+
+      //--- CONSTANT COMMUNICATION: do NOT kill on a momentary disagreement. The
+      //    adverse read must persist InpExitConfirmBars consecutive bars; a clean
+      //    bar resets the conversation. And while Senseei (the thinking layer)
+      //    still BACKS this direction, we are far more patient (window doubles) —
+      //    so the stage detector and the meta keep talking instead of one-shot
+      //    killing. Genuine, sustained death still exits (window is bounded).
+      bool senseeiBacks = (meta.master==dir && meta.confidence>=40.0 && meta.threat<60.0);
+      int  needBars     = MathMax(1, senseeiBacks ? InpExitConfirmBars*2 : InpExitConfirmBars);
+      if(newBar){ if(invalidated) c.adverseBars++; else c.adverseBars=0; }
+      bool confirmed = (c.adverseBars>=needBars);
+
+      if(invalidated && confirmed)
         {
          v.doExit=true;
          v.reason = chainDeath ? "chain death (whole lineage bled out)"
                   : residualCollapse ? "residual collapse (no gas left, late cycle)"
                   : "campaign invalidated (owner/struct flip · exhaustion · terminal · life dead)";
+         v.reason += StringFormat(" · confirmed %d/%d bars%s", c.adverseBars, needBars, senseeiBacks?" (senseei-backed)":"");
          return;
         }
-      if(rotationAgainst && resolvedAgainst)
+      if(rotationAgainst && resolvedAgainst && !senseeiBacks)
         { v.doReverse=true; v.reason="control transfer against position"; }
       if(!c.partialDone)
         {
@@ -3509,6 +3536,7 @@ public:
       m_camp.initTarget=op.target; m_camp.origVol=vol; m_camp.family=op.family; m_camp.mgmt=op.mgmt;
       m_camp.partialDone=false; m_camp.adds=0; m_camp.ticket=tk;
       m_camp.tp1=t1; m_camp.tp2=t2; m_camp.tp3=t3; m_camp.tp1Done=false; m_camp.tp2Done=false;
+      m_camp.adverseBars=0;
      }
    //--- build the TP ladder from the invisible-network path + attack sequence,
    //    falling back to measured-move ATR multiples. Targets ordered by distance.
@@ -3534,10 +3562,10 @@ public:
       if(IsNa(t2)) t2=(dir==1)?entry+atr*3.0:entry-atr*3.0;
       if(IsNa(t3)) t3=(dir==1)?entry+atr*5.0:entry-atr*5.0;
      }
-   void ManagePosition()
+   void ManagePosition(bool newBar)
      {
       if(m_exec.CountActive()==0){ m_camp.active=false; return; }
-      PositionVerdict v; PositionIntelligence::Evaluate(m_f60,m_obs,m_camp,Mid(),v);
+      PositionVerdict v; PositionIntelligence::Evaluate(m_f60,m_obs,m_camp,Mid(),m_meta,newBar,v);
       if(v.doExit){ m_exec.CloseAll(v.reason); m_camp.active=false; return; }
       double px=Mid(); int dir=m_camp.dir;
       //--- staged partials along the TP ladder (network/attack targets):
@@ -3602,7 +3630,7 @@ public:
          m_haveScan=HyperIntelligence::Scan(m_f60,m_obs,m_best,m_meta);
         }
       if(cap.RequiresFlat()){ if(m_exec.CountActive()>0){ m_exec.CloseAll("Capital SUSPENDED"); m_camp.active=false; } return; }
-      ManagePosition();
+      ManagePosition(stepped);
       if(stepped) ConsiderEntry(cap,concurrentActive,exposureBudget);
      }
    string Diag()
