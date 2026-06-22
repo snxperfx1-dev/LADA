@@ -3139,6 +3139,13 @@ public:
       double stop;
       if(!IsNa(op.invalidation)&&((op.direction==1&&op.invalidation<entry)||(op.direction==-1&&op.invalidation>entry))) stop=op.invalidation;
       else stop=(op.direction==1)?entry-InpMinStopAtr*atr:entry+InpMinStopAtr*atr;
+      //--- CRITICAL BLOW-UP GUARD: floor the stop distance at InpMinStopAtr*ATR.
+      //    A degenerate / too-tight structure invalidation (stop sitting on top of
+      //    entry) otherwise collapses stopPts toward zero and EXPLODES position
+      //    size (lots = riskMoney / ~0). This is why volume ran to 13+ lots.
+      double minAtrDist=InpMinStopAtr*atr;
+      if(op.direction==1 && (entry-stop)<minAtrDist) stop=entry-minAtrDist;
+      if(op.direction==-1&& (stop-entry)<minAtrDist) stop=entry+minAtrDist;
       double md=MinStopDist();
       if(md>0){ if(op.direction==1&&(entry-stop)<md) stop=entry-md; if(op.direction==-1&&(stop-entry)<md) stop=entry+md; }
       stop=NormPx(stop);
