@@ -2635,6 +2635,9 @@ enum EntryFamily
   };
 enum MgmtStyle { MGMT_NORMAL=0, MGMT_AGGRESSIVE, MGMT_SCALP, MGMT_RUNNER, MGMT_COUNTERTREND };
 
+//=== Opportunity lifecycle state (Stage 3 — what type/stage of opportunity) =====
+enum ENUM_OPP_STAGE { OPP_OBSERVE=0, OPP_PREPARE, OPP_SPAWN, OPP_ATTACK, OPP_TRANSITION, OPP_EXPANSION, OPP_TERMINAL };
+
 string FamilyName(EntryFamily f)
   {
    switch(f){ case FAM_COMPRESSION:return"Compression"; case FAM_ROTATION:return"Rotation"; case FAM_NETWORK:return"Network";
@@ -2821,6 +2824,32 @@ public:
       if(tqeVeto) return false;
       for(int i=0;i<n;i++) if(cand[i].valid && cand[i].asymmetry>bestA){ bestA=cand[i].asymmetry; best=cand[i]; }
       return best.valid;
+     }
+
+   //--- opportunity lifecycle stage (Stage 3): where in the entry cycle are we?
+   static int OppStage(const F60State &s,const ObserverBus &o,const Opportunity &best,bool haveScan,const MetaInputs &meta)
+     {
+      string ph=s.tfPhaseStr[TF_CANON];
+      bool terminal   = OmegaStr::Has(ph,"Terminal")||OmegaStr::Has(ph,"Liquidation");
+      bool attack     = haveScan && best.valid && meta.confidence>=(double)InpMinConviction;
+      bool transition = OmegaStr::Has(ph,"Transition") || (o.rie_rotationProb>60.0 && o.rie_transferDir!=0) || s.treeTransferDir!=0;
+      bool spawn      = s.recursiveComplete || s.tfWp[TF_CANON]<15.0;     // fresh wave / Point-4 origin
+      bool expansion  = (OmegaStr::Has(ph,"Expansion")&&!OmegaStr::Has(ph,"Induction")&&!OmegaStr::Has(ph,"Liquidity"))
+                      || OmegaStr::Has(ph,"New High")||OmegaStr::Has(ph,"New Low");
+      bool prepare    = haveScan && (meta.opportunity=="GOOD"||meta.opportunity=="STRONG"||meta.opportunity=="EXCEPTIONAL");
+      if(terminal)   return OPP_TERMINAL;
+      if(attack)     return OPP_ATTACK;
+      if(transition) return OPP_TRANSITION;
+      if(spawn)      return OPP_SPAWN;
+      if(expansion)  return OPP_EXPANSION;
+      if(prepare)    return OPP_PREPARE;
+      return OPP_OBSERVE;
+     }
+   static string OppStageStr(int st)
+     {
+      switch(st){ case OPP_PREPARE:return"PREPARE"; case OPP_SPAWN:return"SPAWN"; case OPP_ATTACK:return"ATTACK";
+                  case OPP_TRANSITION:return"TRANSITION"; case OPP_EXPANSION:return"EXPANSION"; case OPP_TERMINAL:return"TERMINAL"; }
+      return "OBSERVE";
      }
   };
 
@@ -3071,6 +3100,9 @@ struct Campaign
   };
 struct PositionVerdict { bool doExit, doPartial, doTrail, doReverse; double newSL; string reason; };
 
+//=== Campaign-health state (Stage 6) — is the campaign behaving correctly? =====
+enum ENUM_CAMP_HEALTH { CH_HEALTHY=0, CH_ACCELERATING=1, CH_STALLING=2, CH_TRANSITIONING=3, CH_DYING=4, CH_TERMINAL=5 };
+
 class PositionIntelligence
   {
 public:
@@ -3099,6 +3131,35 @@ public:
          if(tgtHit || matureFade){ v.doPartial=true; v.reason="first objective / maturity — bank partial"; }
         }
       if(InpTrailStops && !IsNa(o.ie2_inv)) { v.doTrail=true; v.newSL=o.ie2_inv; }
+     }
+
+   //--- classify the live campaign's behaviour (Stage 6 readout + management bias)
+   static int Health(const F60State &s,const ObserverBus &o,int dir)
+     {
+      if(dir==0) return CH_HEALTHY;
+      bool terminal = OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Terminal")
+                    || OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Liquidation")
+                    || s.resCode==2;
+      bool dying = s.life<=32.0 || s.chainVitality<30.0
+                 || (s.ownerDir!=0 && s.ownerDir!=dir && s.chainVitality<40.0);
+      bool transitioning = (o.rie_rotationProb>55.0 && o.rie_transferDir!=0 && o.rie_transferDir!=dir)
+                         || (s.structBias!=0 && s.structBias!=dir)
+                         || s.treeTransferDir!=0;
+      bool accelerating = s.progressing && (o.erf_residual>55.0 || s.fce_budget>55.0) && s.life>=50.0;
+      bool stalling = (!s.progressing && s.fce_maturity>70.0) || s.cpState==0;  // cpState 0 = LEAKING
+      if(terminal)      return CH_TERMINAL;
+      if(dying)         return CH_DYING;
+      if(transitioning) return CH_TRANSITIONING;
+      if(accelerating)  return CH_ACCELERATING;
+      if(stalling)      return CH_STALLING;
+      return CH_HEALTHY;
+     }
+   static string HealthStr(int h)
+     {
+      switch(h){ case CH_ACCELERATING:return"ACCELERATING"; case CH_STALLING:return"STALLING";
+                 case CH_TRANSITIONING:return"TRANSITIONING"; case CH_DYING:return"DYING";
+                 case CH_TERMINAL:return"TERMINAL"; }
+      return "HEALTHY";
      }
   };
 
@@ -3268,6 +3329,9 @@ public:
       Row(r++, StringFormat("Observ   MCE %.0f/cf%.0f  RIE %.0f  FRZ %.0f  TQE %.0f", o.mce_score, o.mce_conflict, o.rie_rotationProb, o.frz_approachQ, o.tqe_quality), FG);
       Row(r++, StringFormat("Senseei  %s  conf %.0f  threat %.0f", MasterStr(meta.master), meta.confidence, meta.threat), DirCol(meta.master));
       Row(r++, StringFormat("Opp      %s · %s · %s", meta.opportunity, meta.timing, meta.intent), OppCol(meta.opportunity));
+      int stg=HyperIntelligence::OppStage(s,o,best,haveScan,meta);
+      color sc=(stg==OPP_ATTACK||stg==OPP_EXPANSION)?GRN:(stg==OPP_PREPARE||stg==OPP_SPAWN)?AMB:(stg==OPP_TERMINAL||stg==OPP_TRANSITION)?RED:DIM;
+      Row(r++, "Stage    "+HyperIntelligence::OppStageStr(stg), sc);
       string setupTx = (haveScan && best.valid)
                        ? StringFormat("%s/%s %s  conv %.0f  asym %.2f", FamilyName(best.family), MgmtName(best.mgmt),
                                        best.direction==1?"LONG":best.direction==-1?"SHORT":"-", best.conviction, best.asymmetry)
@@ -3290,6 +3354,10 @@ public:
       Row(r++, StringFormat("Position %d  %s   campaigns %d/%d", posCount, posCount>0?(netDir==1?"LONG":"SHORT"):"flat", campaigns, maxConc), posCount>0?DirCol(netDir):DIM);
       if(camp.active || posCount>0)
          Row(r++, StringFormat("Targets  T1 %s%s  T2 %s%s  T3 %s", PxS(camp.tp1), camp.tp1Done?" OK":"", PxS(camp.tp2), camp.tp2Done?" OK":"", PxS(camp.tp3)), CYA);
+      if(posCount>0)
+        { int h=PositionIntelligence::Health(s,o,netDir);
+          color hc=(h==CH_HEALTHY||h==CH_ACCELERATING)?GRN:(h==CH_STALLING||h==CH_TRANSITIONING)?AMB:RED;
+          Row(r++, "Campaign "+PositionIntelligence::HealthStr(h), hc); }
 
       //--- ACTION — what the organism is about to do
       string act; color ac;
@@ -3297,7 +3365,8 @@ public:
       else if(posCount>0)               { act="MANAGING open position";      ac=CYA; }
       else if(cap.BlocksEntries())      { act="STAND DOWN — capital restricted"; ac=AMB; }
       else if(tri.confidence<25.0||tri.life<20.0) { act="VETO — Trinity (low life/confidence)"; ac=AMB; }
-      else if(haveScan && best.valid)   { act="READY — "+FamilyName(best.family)+" "+(best.direction==1?"LONG":"SHORT"); ac=GRN; }
+      else if(haveScan && best.valid)   { act="ATTACK — "+FamilyName(best.family)+" "+(best.direction==1?"LONG":"SHORT"); ac=GRN; }
+      else if(stg==OPP_PREPARE)         { act="PREPARE — building, not yet"; ac=AMB; }
       else                              { act="WAITING for a qualified setup"; ac=DIM; }
       Row(r++, "Action   "+act, ac);
 
