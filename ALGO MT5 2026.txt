@@ -67,6 +67,9 @@ input bool   InpAllowCountertrend= true;    // Allow counter-trend (reduced) ent
 input bool   InpAllowAdds        = true;    // Allow continuation adds
 input int    InpMaxAddsPerCampaign = 2;     // Max adds per campaign
 input bool   InpUseBeliefCloud   = true;    // Fold belief cloud (Execution Probability) into conviction
+input bool   InpSenseeiEntry     = true;    // Senseei (phases+lifecycle+meta) is a PRIMARY entry driver
+input double InpSenseeiMinLife   = 45.0;    // Min lifecycle 'life' for a Senseei-driven entry
+input bool   InpNetworkGatesEntry= false;   // Invisible-network pressure may TRIGGER entries (false = path/coords only)
 
 input group "=== Risk / Capital (Omega inheritance) ==="
 input double InpRiskPctBase      = 0.5;     // Base risk % (full conviction/size)
@@ -2632,7 +2635,7 @@ public:
 enum EntryFamily
   {
    FAM_NONE=0, FAM_COMPRESSION, FAM_ROTATION, FAM_NETWORK, FAM_CONTINUATION,
-   FAM_EXHAUSTION, FAM_FLIPZONE, FAM_LIQUIDATION, FAM_EXPANSION
+   FAM_EXHAUSTION, FAM_FLIPZONE, FAM_LIQUIDATION, FAM_EXPANSION, FAM_SENSEEI
   };
 enum MgmtStyle { MGMT_NORMAL=0, MGMT_AGGRESSIVE, MGMT_SCALP, MGMT_RUNNER, MGMT_COUNTERTREND };
 
@@ -2643,7 +2646,7 @@ string FamilyName(EntryFamily f)
   {
    switch(f){ case FAM_COMPRESSION:return"Compression"; case FAM_ROTATION:return"Rotation"; case FAM_NETWORK:return"Network";
               case FAM_CONTINUATION:return"Continuation"; case FAM_EXHAUSTION:return"Exhaustion"; case FAM_FLIPZONE:return"FlipZone";
-              case FAM_LIQUIDATION:return"Liquidation"; case FAM_EXPANSION:return"Expansion"; }
+              case FAM_LIQUIDATION:return"Liquidation"; case FAM_EXPANSION:return"Expansion"; case FAM_SENSEEI:return"Senseei"; }
    return "None";
   }
 string MgmtName(MgmtStyle m)
@@ -2709,10 +2712,11 @@ private:
       op.family=fam; op.tfIdx=tfIdx; op.tf=OmegaTfEnum(tfIdx); op.direction=dir;
       op.entry=entry; op.target=target; op.invalidation=inv; op.label=FamilyName(fam);
       bool ct=(dir!=0 && s.fractalStackDir!=0 && dir!=s.fractalStackDir);
-      //--- ALIGN ALL OF THIS: network bias ↔ curve-tree owner ↔ fractal stack ↔
-      //    canonical wave. Full agreement lifts conviction, disagreement dampens.
-      int aln=(s.netBias==dir?1:0)+(s.ownerDir==dir?1:0)+(s.fractalStackDir==dir?1:0)+(s.tfDir[TF_CANON]==dir?1:0);
-      conv*=(0.70+(double)aln/4.0*0.45);     // 0.70 (none) .. 1.15 (all four agree)
+      //--- ALIGN ALL OF THIS: curve-tree owner ↔ fractal stack ↔ canonical wave.
+      //    (Invisible network is EXCLUDED — it supplies path coordinates, it does
+      //    NOT vote on whether to take the trade.) Full agreement lifts conviction.
+      int aln=(s.ownerDir==dir?1:0)+(s.fractalStackDir==dir?1:0)+(s.tfDir[TF_CANON]==dir?1:0);
+      conv*=(0.70+(double)aln/3.0*0.45);     // 0.70 (none) .. 1.15 (all three agree)
       op.conviction=OmegaMath::Clamp(conv,0.0,100.0);
       op.mgmt=PickMgmt(fam,ct,s);
       double atr=MathMax(s.atr,1e-10);
@@ -2801,8 +2805,10 @@ public:
           double conv=o.rie_rotationProb*0.55+(s.treeTransferDir!=0?20.0:0.0)+(s.structBias==dir?15.0:0.0)
                       +(InpUseBeliefCloud?s.retrBelief*0.15:0.0)-conflictPenalty*0.5;
           cand[n++]=Make(FAM_ROTATION,TF_CANON,dir,close,tgt,o.ie2_inv,conv*g,s); }
-      // 5) NETWORK — routes to the next node on the invisible-network path
-      if(s.eligibleNodes>0 && MathAbs(s.pressure)>25.0 && s.pdir!=0)
+      // 5) NETWORK — OFF by default: the invisible network supplies PATH COORDINATES
+      //    (targets) to the other families, it does NOT decide whether to enter.
+      //    Re-enable pressure-triggered network entries only via InpNetworkGatesEntry.
+      if(InpNetworkGatesEntry && s.eligibleNodes>0 && MathAbs(s.pressure)>25.0 && s.pdir!=0)
         { int dir=s.pdir; double tgt=!IsNa(s.path.toPx)?s.path.toPx:((dir==1)?s.nodeAbove:s.nodeBelow);
           double conv=MathAbs(s.pressure)*0.40+o.frz_attractorScore*0.25+MathMin(s.eligibleNodes*4.0,25.0)+s.path.primaryConf*0.15-conflictPenalty;
           cand[n++]=Make(FAM_NETWORK,TF_CANON,dir,close,tgt,o.ie2_inv,conv*g,s); }
@@ -2823,6 +2829,33 @@ public:
           double conv=o.erf_exhaustScore*0.55+s.fce_convexity*0.25+(s.tfAtExt[own]?15.0:0.0)
                       +(InpUseBeliefCloud?s.retrBelief*0.12:0.0)-conflictPenalty*0.5;
           cand[n++]=Make(FAM_EXHAUSTION,own,dir,close,tgt,o.ie2_inv,conv*g,s); }
+
+      // 9) SENSEEI — the meta-intelligence is a PRIMARY entry driver (phases +
+      //    lifecycle + senseei agree). Direction = Senseei master vote. Gate =
+      //    opportunity GOOD/STRONG/EXCEPTIONAL + life alive + phase not dead.
+      //    The invisible network only SUPPLIES the target coordinate here.
+      if(InpSenseeiEntry && meta.master!=0 &&
+         (meta.opportunity=="GOOD"||meta.opportunity=="STRONG"||meta.opportunity=="EXCEPTIONAL"))
+        {
+         int dir=meta.master;
+         string famCanon=F60FamS(s.tfPhase[TF_CANON]);
+         bool phaseAlive = famCanon!="Terminal" && famCanon!="Liquidation"
+                         && !OmegaStr::Has(s.tfPhaseStr[TF_CANON],"Absorption");
+         bool lifeAlive  = s.life>=InpSenseeiMinLife;       // lifecycle confirm
+         if(phaseAlive && lifeAlive)
+           {
+            // target = network path coordinate, else target engine, else node, else ATR projection
+            double tgt=!IsNa(s.path.toPx)?s.path.toPx
+                      :!IsNa(o.te_target)?o.te_target
+                      :((dir==1)?s.nodeAbove:s.nodeBelow);
+            if(IsNa(tgt)) tgt=(dir==1)?close+s.atr*2.5:close-s.atr*2.5;
+            // conviction IS the senseei (oppScore + confidence) tempered by life.
+            // NOT multiplied by metaFactor (that would double-count the meta);
+            // tqe quality gate + absorption damper still apply as risk filters.
+            double conv=meta.oppScore*0.55+meta.confidence*0.30+s.life*0.15;
+            cand[n++]=Make(FAM_SENSEEI,TF_CANON,dir,close,tgt,o.ie2_inv,conv*tqeGate*absDamp,s);
+           }
+        }
 
       best.valid=false; double bestA=-1.0;
       if(tqeVeto) return false;
