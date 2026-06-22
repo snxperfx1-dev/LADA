@@ -66,6 +66,7 @@ input double InpMinAsymmetry     = 1.3;     // Min reward:risk*prob to act
 input bool   InpAllowCountertrend= true;    // Allow counter-trend (reduced) entries
 input bool   InpAllowAdds        = true;    // Allow continuation adds
 input int    InpMaxAddsPerCampaign = 2;     // Max adds per campaign
+input bool   InpUseBeliefCloud   = true;    // Fold belief cloud (Execution Probability) into conviction
 
 input group "=== Risk / Capital (Omega inheritance) ==="
 input double InpRiskPctBase      = 0.5;     // Base risk % (full conviction/size)
@@ -591,6 +592,37 @@ string F60PhaseStr(int c)
    return "Point 4 Origin";
   }
 int F60DirByOrigin(double origin,int fallback,double close){ if(IsNa(origin)) return fallback; return close>origin?1:close<origin?-1:fallback; }
+
+//--- phase family (short label) — the WAVE NARRATIVE read of a TF's phase
+string F60FamS(int ph)
+  {
+   string p=F60PhaseStr(ph);
+   if(StringFind(p,"Transition")>=0)     return "Transition";
+   if(StringFind(p,"Terminal")>=0)       return "Terminal";
+   if(StringFind(p,"Liquidation")>=0)    return "Liquidation";
+   if(StringFind(p,"HTF Flip")>=0)       return "Flip Zone";
+   if(StringFind(p,"Induction")>=0 && StringFind(p,"Expansion")<0) return "Induction";
+   if(StringFind(p,"Pre-Convexity")>=0)  return "Pre-Conv";
+   if(StringFind(p,"Liquidity")>=0)      return "Liquidity";
+   if(StringFind(p,"New High")>=0 || StringFind(p,"New Low")>=0)   return "Creation";
+   if(StringFind(p,"Return")>=0)         return "Return";
+   if(StringFind(p,"Retracement")>=0)    return "Retracement";
+   return "Expansion";
+  }
+
+//--- map a single phase to the campaign-stage story (V60 vocabulary)
+string F60Story(int ph)
+  {
+   string p=F60PhaseStr(ph);
+   if(StringFind(p,"Expansion")>=0 && StringFind(p,"Induction")<0 && StringFind(p,"Liquidity")<0) return "EXPANSION";
+   if(StringFind(p,"New High")>=0 || StringFind(p,"New Low")>=0)                                   return "DELIVERY";
+   if(StringFind(p,"Transition")>=0)                                                               return "TRANSITION";
+   if(StringFind(p,"Induction")>=0 || StringFind(p,"Liquidity")>=0)                                return "DISTRIBUTION";
+   if(StringFind(p,"Liquidation")>=0 || StringFind(p,"Terminal")>=0)                               return "LIQUIDATION";
+   if(StringFind(p,"Demand Return")>=0 || StringFind(p,"Supply Return")>=0)                        return "CAMPAIGN TRANSITION";
+   if(StringFind(p,"Retracement")>=0 || StringFind(p,"Flip")>=0)                                   return "ACCUMULATION";
+   return "BALANCE";
+  }
 
 class SEEngine
   {
@@ -1170,9 +1202,10 @@ public:
    //    Substrate must have filled: tf* · fractal · structBias · network · recursiveDepth.
    void Update(const F60State &s, double recDom, double close)
      {
-      //--- owner = highest mid-progress rung with strongest model fit (MTF curve map)
+      //--- owner = strongest-model-fit rung with direction (phase/structure leads,
+      //    NOT wave progress — progress is display-only per design).
       int owner=-1; double bestMf=-1;
-      for(int i=8;i>=0;i--) if(s.tfDir[i]!=0 && s.tfWp[i]>=15.0 && s.tfWp[i]<=92.0 && s.tfMf[i]>bestMf){ bestMf=s.tfMf[i]; owner=i; }
+      for(int i=8;i>=0;i--) if(s.tfDir[i]!=0 && s.tfMf[i]>bestMf){ bestMf=s.tfMf[i]; owner=i; }
       if(owner<0) for(int i=8;i>=0;i--) if(s.tfDir[i]!=0){ owner=i; break; }
       ownerTf=owner; ownerDir=(owner>=0)?s.tfDir[owner]:0;
 
@@ -2334,19 +2367,20 @@ public:
       o.mce_conflict = OmegaMath::Clamp((od!=0 && s.fractalStackDir!=0 && od!=s.fractalStackDir ? 50.0:0.0)
                        + s.timeConflict*0.50, 0.0, 100.0);
 
-      //=== NE — dominant narrative (owner phase lineage + chain) =====
+      //=== NE — dominant narrative driven by the WAVE NARRATIVE (per-TF phase
+      //    ladder), led by the execution band, NOT the progress-selected owner.
       o.ne_dir = od; o.ne_maturity = s.fce_maturity;
-      string ph = s.tfPhaseStr[own];
-      string story;
-      if(OmegaStr::Has(ph,"Expansion") && !OmegaStr::Has(ph,"Induction") && !OmegaStr::Has(ph,"Liquidity")) story="EXPANSION";
-      else if(OmegaStr::Has(ph,"Induction") || OmegaStr::Has(ph,"Liquidity"))                              story="DISTRIBUTION";
-      else if(OmegaStr::Has(ph,"Retracement") || OmegaStr::Has(ph,"Flip"))                                 story="ACCUMULATION";
-      else if(OmegaStr::Has(ph,"Liquidation") || OmegaStr::Has(ph,"Terminal"))                             story="LIQUIDATION";
-      else if(OmegaStr::Has(ph,"Demand Return") || OmegaStr::Has(ph,"Supply Return"))                      story="CAMPAIGN TRANSITION";
-      else if(OmegaStr::Has(ph,"New High") || OmegaStr::Has(ph,"New Low"))                                 story="DELIVERY";
-      else                                                                                                 story="BALANCE";
-      // chain vitality strengthens / weakens the conviction of the story
-      if(s.chainVitality<35.0 && story!="LIQUIDATION") story=story+" (weak)";
+      int    phExec = s.tfPhase[TF_CANON];                 // M5 — most responsive tradeable read
+      int    htfRung = (own>=5)?own:5;                      // H4+ context rung
+      string famExec = F60FamS(phExec);
+      string famHtf  = F60FamS(s.tfPhase[htfRung]);
+      string story   = F60Story(phExec);                    // story = what the exec band is doing now
+      //-- explicit TRANSITION: exec band has flipped away from the HTF context
+      if(famExec!=famHtf && s.tfDir[TF_CANON]!=0 && s.tfDir[htfRung]!=0 && s.tfDir[TF_CANON]!=s.tfDir[htfRung])
+         story="TRANSITION";
+      //-- M15 confirmation upgrades a forming expansion to delivery context
+      if(story=="EXPANSION" && F60FamS(s.tfPhase[3])=="Creation") story="DELIVERY";
+      if(s.chainVitality<35.0 && story!="LIQUIDATION" && story!="TRANSITION") story=story+" (weak)";
       o.ne_story = story;
 
       //=== TQE — trade qualification (veto gate) ===================
@@ -2606,16 +2640,23 @@ public:
       bool   tqeVeto=(o.tqe_quality<20.0);
       // meta factor — commander modulation (confidence lifts, threat dampens)
       double metaFactor=OmegaMath::Clamp(0.70+meta.confidence/200.0-meta.threat/300.0,0.55,1.20);
-      double g=tqeGate*metaFactor;
+      //--- ABSORPTION DAMPER — high absorption belief (Execution Probability) scales
+      //    every directional setup down, so "67% Absorption" => stand down by design.
+      double absDamp = InpUseBeliefCloud ? OmegaMath::Clamp(1.0 - s.absBelief/160.0, 0.45, 1.0) : 1.0;
+      double g=tqeGate*metaFactor*absDamp;
 
-      // 1) CONTINUATION
-      if(od!=0 && s.tfWp[own]>=18.0 && s.tfWp[own]<=85.0)
-        { double conv=s.chainVitality*0.40+s.fractalStackScore*0.25+s.fce_budget*0.20+o.te_quality*0.15-conflictPenalty;
+      // 1) CONTINUATION — gated by the WAVE NARRATIVE (phase family), not progress
+      string famOwn=F60FamS(s.tfPhase[own]);
+      bool contOk = od!=0 && (famOwn=="Expansion"||famOwn=="Pre-Conv"||famOwn=="Creation"||famOwn=="Return");
+      if(contOk)
+        { double conv=s.chainVitality*0.35+s.fractalStackScore*0.25+s.fce_budget*0.15+o.te_quality*0.10
+                      +(InpUseBeliefCloud?s.convBelief*0.15:0.0)-conflictPenalty;
           cand[n++]=Make(FAM_CONTINUATION,own,od,close,o.te_target,o.ie2_inv,conv*g,s); }
       // 2) EXPANSION
       if(s.structBias!=0 && (s.bullImp||s.bearImp))
         { int dir=(s.bullImp?1:-1);
-          double conv=s.tfMf[TF_CANON]*0.35+s.fce_residual*0.30+s.fractalStackScore*0.20+(s.eligibleNodes>0?15.0:0.0)-conflictPenalty;
+          double conv=s.tfMf[TF_CANON]*0.30+s.fce_residual*0.25+s.fractalStackScore*0.20+(s.eligibleNodes>0?15.0:0.0)
+                      +(InpUseBeliefCloud?s.expBelief*0.15:0.0)-conflictPenalty;
           cand[n++]=Make(FAM_EXPANSION,TF_CANON,dir,close,o.te_target,o.ie2_inv,conv*g,s); }
       // 3) COMPRESSION RELEASE
       { int relIdx=TF_CANON; double bestCp=0; for(int i=1;i<=4;i++){ if(s.tfCompPersist[i]>bestCp){ bestCp=s.tfCompPersist[i]; relIdx=i; } }
@@ -2626,7 +2667,8 @@ public:
       // 4) ROTATION (often counter-trend)
       if(o.rie_rotationProb>55.0 && o.rie_transferDir!=0)
         { int dir=o.rie_transferDir; double tgt=(dir==1)?s.nodeAbove:s.nodeBelow;
-          double conv=o.rie_rotationProb*0.55+(s.treeTransferDir!=0?20.0:0.0)+(s.structBias==dir?15.0:0.0)-conflictPenalty*0.5;
+          double conv=o.rie_rotationProb*0.55+(s.treeTransferDir!=0?20.0:0.0)+(s.structBias==dir?15.0:0.0)
+                      +(InpUseBeliefCloud?s.retrBelief*0.15:0.0)-conflictPenalty*0.5;
           cand[n++]=Make(FAM_ROTATION,TF_CANON,dir,close,tgt,o.ie2_inv,conv*g,s); }
       // 5) NETWORK
       if(s.eligibleNodes>0 && MathAbs(s.pressure)>25.0 && s.pdir!=0)
@@ -2647,7 +2689,8 @@ public:
       if(o.erf_exhaustScore>60.0 && od!=0)
         { int dir=-od; double tgt=(dir==1)?s.nodeAbove:s.nodeBelow;
           if(IsNa(tgt)) tgt=(dir==1)?close+s.atr*2.0:close-s.atr*2.0;
-          double conv=o.erf_exhaustScore*0.55+s.fce_convexity*0.25+(s.tfAtExt[own]?15.0:0.0)-conflictPenalty*0.5;
+          double conv=o.erf_exhaustScore*0.55+s.fce_convexity*0.25+(s.tfAtExt[own]?15.0:0.0)
+                      +(InpUseBeliefCloud?s.retrBelief*0.12:0.0)-conflictPenalty*0.5;
           cand[n++]=Make(FAM_EXHAUSTION,own,dir,close,tgt,o.ie2_inv,conv*g,s); }
 
       best.valid=false; double bestA=-1.0;
